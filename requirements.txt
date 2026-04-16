@@ -1,0 +1,11 @@
+python-dotenv
+requests
+tradingview-ta
+pydantic
+aiogram
+openai
+yfinance
+pandas
+numpy
+scikit-learn
+joblib
