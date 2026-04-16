@@ -66,7 +66,8 @@ class BucketStats:
     sample_size: int
     avg_outcome_15m_pct: Optional[float]
     median_outcome_15m_pct: Optional[float]
-    avg_realized_pnl_pct: Optional[float]
+    avg_realized_gross_pnl_pct: Optional[float]
+    avg_realized_net_pnl_pct: Optional[float]
     pct_positive: Optional[float]
     pct_negative: Optional[float]
     pct_zero: Optional[float]
@@ -219,7 +220,15 @@ class AdaptiveAnalysisEngine:
                     "volume_ratio_bucket": volume_ratio_bucket(feat.get("volume_ratio")),
                     "volatility_bucket": volatility_bucket(feat.get("volatility_20")),
                     "hour_utc": self._hour_utc(row.get("signal_ts")),
-                    "realized_pnl_pct": _safe_float(close_details.get("pnl_pct")),
+                    "realized_gross_pnl_pct": _safe_float(close_details.get("gross_pnl_pct")),
+                    "realized_net_pnl_pct": _safe_float(close_details.get("net_pnl_pct"))
+                    if _safe_float(close_details.get("net_pnl_pct")) is not None
+                    else _safe_float(close_details.get("pnl_pct")),
+                    "realized_gross_pnl_rub": _safe_float(close_details.get("gross_pnl")),
+                    "realized_net_pnl_rub": _safe_float(close_details.get("net_pnl"))
+                    if _safe_float(close_details.get("net_pnl")) is not None
+                    else _safe_float(close_details.get("pnl")),
+                    "commission_rub": _safe_float(close_details.get("commission_rub")),
                     "close_reason": row.get("close_reason_code") or row.get("close_reason_text"),
                     "near_zero_close": self._is_near_zero_close(close_details),
                 }
@@ -269,8 +278,16 @@ class AdaptiveAnalysisEngine:
 
     @staticmethod
     def _is_near_zero_close(close_details: Dict[str, Any]) -> bool:
-        pnl = _safe_float(close_details.get("pnl"))
-        pnl_pct = _safe_float(close_details.get("pnl_pct"))
+        pnl = (
+            _safe_float(close_details.get("net_pnl"))
+            if _safe_float(close_details.get("net_pnl")) is not None
+            else _safe_float(close_details.get("pnl"))
+        )
+        pnl_pct = (
+            _safe_float(close_details.get("net_pnl_pct"))
+            if _safe_float(close_details.get("net_pnl_pct")) is not None
+            else _safe_float(close_details.get("pnl_pct"))
+        )
         if pnl is not None and abs(pnl) < 10:
             return True
         if pnl_pct is not None and abs(pnl_pct) < 0.05:
@@ -320,10 +337,15 @@ class AdaptiveAnalysisEngine:
         for bucket, bucket_rows in grouped.items():
             outcomes = [_safe_float(row.get("outcome_15m_pct")) for row in bucket_rows]
             outcome_vals = [v for v in outcomes if v is not None]
-            realized_vals = [
-                _safe_float(row.get("realized_pnl_pct"))
+            realized_gross_vals = [
+                _safe_float(row.get("realized_gross_pnl_pct"))
                 for row in bucket_rows
-                if _safe_float(row.get("realized_pnl_pct")) is not None
+                if _safe_float(row.get("realized_gross_pnl_pct")) is not None
+            ]
+            realized_net_vals = [
+                _safe_float(row.get("realized_net_pnl_pct"))
+                for row in bucket_rows
+                if _safe_float(row.get("realized_net_pnl_pct")) is not None
             ]
             positive = sum(1 for v in outcome_vals if v > 0)
             negative = sum(1 for v in outcome_vals if v < 0)
@@ -343,7 +365,12 @@ class AdaptiveAnalysisEngine:
                 sample_size=n,
                 avg_outcome_15m_pct=(sum(outcome_vals) / n) if n else None,
                 median_outcome_15m_pct=_median(outcome_vals),
-                avg_realized_pnl_pct=(sum(realized_vals) / len(realized_vals)) if realized_vals else None,
+                avg_realized_gross_pnl_pct=(
+                    (sum(realized_gross_vals) / len(realized_gross_vals)) if realized_gross_vals else None
+                ),
+                avg_realized_net_pnl_pct=(
+                    (sum(realized_net_vals) / len(realized_net_vals)) if realized_net_vals else None
+                ),
                 pct_positive=(100.0 * positive / n) if n else None,
                 pct_negative=(100.0 * negative / n) if n else None,
                 pct_zero=(100.0 * zero / n) if n else None,
@@ -400,7 +427,7 @@ class AdaptiveAnalysisEngine:
                     "ticker": row["ticker"],
                     "signal_ts": row["signal_ts"],
                     "outcome_15m_pct": row["outcome_15m_pct"],
-                    "realized_pnl_pct": row["realized_pnl_pct"],
+                    "realized_net_pnl_pct": row["realized_net_pnl_pct"],
                     "volume_ratio_bucket": row["volume_ratio_bucket"],
                     "hour_utc": row["hour_utc"],
                 }
@@ -413,7 +440,7 @@ class AdaptiveAnalysisEngine:
                     "ticker": row["ticker"],
                     "signal_ts": row["signal_ts"],
                     "outcome_15m_pct": row["outcome_15m_pct"],
-                    "realized_pnl_pct": row["realized_pnl_pct"],
+                    "realized_net_pnl_pct": row["realized_net_pnl_pct"],
                     "volume_ratio_bucket": row["volume_ratio_bucket"],
                     "hour_utc": row["hour_utc"],
                 }
@@ -426,25 +453,31 @@ class AdaptiveAnalysisEngine:
         return report
 
     def _recommend_from_bucket(self, bucket: BucketStats) -> Optional[AdaptiveRecommendation]:
-        if bucket.sample_size < self.min_observations or bucket.avg_outcome_15m_pct is None:
+        primary_metric = (
+            bucket.avg_realized_net_pnl_pct
+            if bucket.avg_realized_net_pnl_pct is not None
+            else bucket.avg_outcome_15m_pct
+        )
+        primary_metric_name = "avg_realized_net_pnl_pct" if bucket.avg_realized_net_pnl_pct is not None else "avg_outcome_15m_pct"
+        if bucket.sample_size < self.min_observations or primary_metric is None:
             return None
 
         max_abs_delta = self.base_ml_threshold * self.max_threshold_delta_frac
         if max_abs_delta <= 0:
             return None
 
-        magnitude = abs(bucket.avg_outcome_15m_pct)
+        magnitude = abs(primary_metric)
         sample_strength = min(1.0, bucket.sample_size / max(self.min_observations * 2, 1))
         outcome_strength = min(1.0, magnitude / 1.0)
         confidence = max(0.05, min(0.99, 0.45 * sample_strength + 0.55 * outcome_strength))
 
-        if bucket.avg_outcome_15m_pct <= self.negative_outcome_pct:
+        if primary_metric <= self.negative_outcome_pct:
             delta = max_abs_delta * confidence
             new_value = min(0.99, self.base_ml_threshold + delta)
             reason_text = (
                 f"Raised ML threshold for volume_ratio {bucket.bucket} from "
                 f"{self.base_ml_threshold:.4f} to {new_value:.4f} because last "
-                f"{bucket.sample_size} BUY had avg outcome_15m_pct={bucket.avg_outcome_15m_pct:.4f} "
+                f"{bucket.sample_size} BUY had {primary_metric_name}={primary_metric:.4f} "
                 f"and near_zero_pct={bucket.near_zero_pct or 0.0:.2f}."
             )
             return AdaptiveRecommendation(
@@ -459,13 +492,13 @@ class AdaptiveAnalysisEngine:
                 metrics=asdict(bucket),
             )
 
-        if bucket.avg_outcome_15m_pct >= self.positive_outcome_pct:
+        if primary_metric >= self.positive_outcome_pct:
             delta = max_abs_delta * confidence * 0.7
             new_value = max(0.0, self.base_ml_threshold - delta)
             reason_text = (
                 f"Lowered ML threshold for volume_ratio {bucket.bucket} from "
                 f"{self.base_ml_threshold:.4f} to {new_value:.4f} because last "
-                f"{bucket.sample_size} BUY had avg outcome_15m_pct={bucket.avg_outcome_15m_pct:.4f} "
+                f"{bucket.sample_size} BUY had {primary_metric_name}={primary_metric:.4f} "
                 f"and pct_positive={bucket.pct_positive or 0.0:.2f}."
             )
             return AdaptiveRecommendation(

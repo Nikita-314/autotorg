@@ -92,6 +92,13 @@ def format_close_pnl_line(pnl: float, pnl_pct: float) -> str:
     return f"{pnl_part} ({pnl_pct:.4f}%)"
 
 
+def format_signed_rub(value: float) -> str:
+    amount = safe_float(value)
+    if abs(amount) < 10:
+        return f"{amount:+.4f} RUB"
+    return f"{amount:+,.2f} RUB".replace(",", " ")
+
+
 def _bar_key_at(dt: datetime, interval: str) -> str:
     """UTC-метка текущего бара (округление под TV_INTERVAL), без смены стратегии/ML."""
     if dt.tzinfo is not None:
@@ -463,6 +470,9 @@ class Settings:
     paper_initial_balance_rub: float
     paper_state_file: str
     paper_balance_state_file: str
+    paper_commission_rate: float
+    paper_commission_min_rub: float
+    paper_include_commission: bool
     bcs_stocks_api_url: str
     bcs_stocks_cache_file: str
     universe_refresh_cycles: int
@@ -520,6 +530,9 @@ class Settings:
             paper_initial_balance_rub=float(os.getenv("PAPER_INITIAL_BALANCE_RUB", "50000")),
             paper_state_file=os.getenv("PAPER_STATE_FILE", "paper_state.json"),
             paper_balance_state_file=os.getenv("PAPER_BALANCE_STATE_FILE", "paper_balance_state.json"),
+            paper_commission_rate=float(os.getenv("PAPER_COMMISSION_RATE", "0.0005")),
+            paper_commission_min_rub=float(os.getenv("PAPER_COMMISSION_MIN_RUB", "0")),
+            paper_include_commission=os.getenv("PAPER_INCLUDE_COMMISSION", "true").lower() == "true",
             bcs_stocks_api_url=os.getenv("BCS_STOCKS_API_URL", "").strip(),
             bcs_stocks_cache_file=os.getenv("BCS_STOCKS_CACHE_FILE", "bcs_stocks_cache.json"),
             universe_refresh_cycles=int(os.getenv("UNIVERSE_REFRESH_CYCLES", "30")),
@@ -1035,7 +1048,9 @@ class PaperBroker:
         self.cash_rub = settings.paper_initial_balance_rub
         self.positions: Dict[str, float] = {}
         self.avg_price: Dict[str, float] = {}
-        self.realized_pnl_rub = 0.0
+        self.open_entry_commission_rub: Dict[str, float] = {}
+        self.realized_gross_pnl_rub = 0.0
+        self.realized_commission_rub = 0.0
         self.trade_count = 0
         self._load()
 
@@ -1046,7 +1061,13 @@ class PaperBroker:
             self.cash_rub = safe_float(payload.get("cash_rub"), self.settings.paper_initial_balance_rub)
             self.positions = {k: safe_float(v) for k, v in payload.get("positions", {}).items()}
             self.avg_price = {k: safe_float(v) for k, v in payload.get("avg_price", {}).items()}
-            self.realized_pnl_rub = safe_float(payload.get("realized_pnl_rub"))
+            self.open_entry_commission_rub = {
+                k: safe_float(v) for k, v in payload.get("open_entry_commission_rub", {}).items()
+            }
+            self.realized_gross_pnl_rub = safe_float(
+                payload.get("realized_gross_pnl_rub"), safe_float(payload.get("realized_pnl_rub"))
+            )
+            self.realized_commission_rub = safe_float(payload.get("realized_commission_rub"))
             self.trade_count = int(payload.get("trade_count", 0))
         if self.balance_state_path.exists():
             with self.balance_state_path.open("r", encoding="utf-8") as file:
@@ -1065,11 +1086,48 @@ class PaperBroker:
             "cash_rub": round(self.cash_rub, 2),
             "positions": self.positions,
             "avg_price": self.avg_price,
-            "realized_pnl_rub": round(self.realized_pnl_rub, 2),
+            "open_entry_commission_rub": self.open_entry_commission_rub,
+            "realized_gross_pnl_rub": round(self.realized_gross_pnl_rub, 2),
+            "realized_commission_rub": round(self.realized_commission_rub, 2),
+            "realized_net_pnl_rub": round(self.realized_net_pnl_rub, 2),
+            "realized_pnl_rub": round(self.realized_net_pnl_rub, 2),
             "trade_count": self.trade_count,
         }
         with self.state_path.open("w", encoding="utf-8") as file:
             json.dump(payload, file, ensure_ascii=True, indent=2)
+
+    @property
+    def realized_net_pnl_rub(self) -> float:
+        return self.realized_gross_pnl_rub - self.realized_commission_rub
+
+    def _commission_for_notional(self, notional_rub: float) -> float:
+        if not self.settings.paper_include_commission:
+            return 0.0
+        notional = abs(safe_float(notional_rub))
+        if notional <= 0:
+            return 0.0
+        return max(
+            notional * max(0.0, self.settings.paper_commission_rate),
+            max(0.0, self.settings.paper_commission_min_rub),
+        )
+
+    def _max_affordable_buy_notional(self, cash_rub: float) -> float:
+        cash = max(0.0, safe_float(cash_rub))
+        if not self.settings.paper_include_commission:
+            return cash
+        rate = max(0.0, self.settings.paper_commission_rate)
+        min_commission = max(0.0, self.settings.paper_commission_min_rub)
+        candidates: List[float] = []
+        notional_case_b = cash - min_commission
+        if notional_case_b > 0:
+            if rate <= 0 or (notional_case_b * rate) <= min_commission + 1e-12:
+                candidates.append(notional_case_b)
+        if rate >= 0:
+            notional_case_a = cash / (1.0 + rate) if (1.0 + rate) > 0 else 0.0
+            if rate <= 0 or (notional_case_a * rate) + 1e-12 >= min_commission:
+                candidates.append(notional_case_a)
+        candidates.append(0.0)
+        return max(candidates)
 
     def _fallback_prices(self) -> Dict[str, float]:
         prices = {symbol: self.avg_price.get(symbol, 0.0) for symbol in self.positions}
@@ -1081,15 +1139,18 @@ class PaperBroker:
         market_value = sum(qty * merged_prices.get(symbol, 0.0) for symbol, qty in self.positions.items())
         equity = self.cash_rub + market_value
         total_pnl = equity - self.initial_balance_rub
-        unrealized_pnl = total_pnl - self.realized_pnl_rub
+        unrealized_pnl = total_pnl - self.realized_net_pnl_rub
         return {
             "initial_balance_rub": round(self.initial_balance_rub, 2),
             "current_balance_rub": round(equity, 2),
             "cash_rub": round(self.cash_rub, 2),
             "market_value_rub": round(market_value, 2),
             "equity_rub": round(equity, 2),
-            "realized_pnl_total_rub": round(self.realized_pnl_rub, 2),
-            "realized_pnl_rub": round(self.realized_pnl_rub, 2),
+            "realized_gross_pnl_rub": round(self.realized_gross_pnl_rub, 2),
+            "realized_commission_rub": round(self.realized_commission_rub, 2),
+            "realized_net_pnl_rub": round(self.realized_net_pnl_rub, 2),
+            "realized_pnl_total_rub": round(self.realized_net_pnl_rub, 2),
+            "realized_pnl_rub": round(self.realized_net_pnl_rub, 2),
             "unrealized_pnl_rub": round(unrealized_pnl, 2),
             "total_pnl_rub": round(total_pnl, 2),
             "trade_count": self.trade_count,
@@ -1107,40 +1168,105 @@ class PaperBroker:
         self._save_trading_state()
         self.sync_balance_snapshot(latest_prices or {})
 
-    def place_order(self, symbol: str, side: str, amount_rub: float, market_price: float) -> None:
+    def place_order(self, symbol: str, side: str, amount_rub: float, market_price: float) -> Optional[Dict[str, Any]]:
         if market_price <= 0 or amount_rub <= 0:
-            return
+            return None
         if side == "BUY":
-            spend = min(self.cash_rub, amount_rub)
+            spend = min(amount_rub, self._max_affordable_buy_notional(self.cash_rub))
             if spend <= 0:
-                return
+                return None
+            commission_rub = self._commission_for_notional(spend)
+            total_cash_out = spend + commission_rub
             qty = spend / market_price
             old_qty = self.positions.get(symbol, 0.0)
             old_avg = self.avg_price.get(symbol, 0.0)
             total_qty = old_qty + qty
             self.avg_price[symbol] = ((old_qty * old_avg) + (qty * market_price)) / total_qty
             self.positions[symbol] = total_qty
-            self.cash_rub -= spend
+            self.open_entry_commission_rub[symbol] = self.open_entry_commission_rub.get(symbol, 0.0) + commission_rub
+            self.cash_rub -= total_cash_out
+            self.realized_commission_rub += commission_rub
             self.trade_count += 1
-            LOGGER.info("[PAPER] BUY %s qty=%.6f price=%.4f", symbol, qty, market_price)
+            LOGGER.info(
+                "[PAPER] BUY %s qty=%.6f price=%.4f commission=%.4f",
+                symbol,
+                qty,
+                market_price,
+                commission_rub,
+            )
+            execution = {
+                "side": side,
+                "qty": qty,
+                "filled_notional_rub": spend,
+                "notional_rub": spend,
+                "commission_rub": commission_rub,
+                "commission_rate": self.settings.paper_commission_rate if self.settings.paper_include_commission else 0.0,
+                "gross_pnl": 0.0,
+                "gross_pnl_pct": 0.0,
+                "net_pnl": -commission_rub,
+                "net_pnl_pct": ((-commission_rub / spend) * 100.0) if spend > 0 else 0.0,
+                "entry_commission_allocated_rub": commission_rub,
+                "exit_commission_rub": 0.0,
+                "cash_after_rub": self.cash_rub,
+            }
         elif side == "SELL":
             held = self.positions.get(symbol, 0.0)
             if held <= 0:
-                return
+                return None
             qty = min(held, amount_rub / market_price)
-            proceeds = qty * market_price
+            if qty <= 0:
+                return None
+            notional_rub = qty * market_price
+            proceeds = notional_rub
+            commission_rub = self._commission_for_notional(notional_rub)
             entry = self.avg_price.get(symbol, market_price)
-            self.realized_pnl_rub += (market_price - entry) * qty
+            gross_pnl = (market_price - entry) * qty
+            gross_pnl_pct = ((market_price / entry) - 1.0) * 100 if entry > 0 else 0.0
+            entry_commission_pool = self.open_entry_commission_rub.get(symbol, 0.0)
+            entry_commission_allocated_rub = entry_commission_pool * (qty / held) if held > 0 else 0.0
+            total_trade_commission_rub = entry_commission_allocated_rub + commission_rub
+            net_pnl = gross_pnl - total_trade_commission_rub
+            notional_entry_rub = entry * qty
+            net_pnl_pct = (net_pnl / notional_entry_rub) * 100.0 if notional_entry_rub > 0 else 0.0
+            self.realized_gross_pnl_rub += gross_pnl
+            self.realized_commission_rub += commission_rub
             left = held - qty
             if left <= 1e-12:
                 self.positions.pop(symbol, None)
                 self.avg_price.pop(symbol, None)
+                self.open_entry_commission_rub.pop(symbol, None)
             else:
                 self.positions[symbol] = left
-            self.cash_rub += proceeds
+                self.open_entry_commission_rub[symbol] = max(0.0, entry_commission_pool - entry_commission_allocated_rub)
+            self.cash_rub += proceeds - commission_rub
             self.trade_count += 1
-            LOGGER.info("[PAPER] SELL %s qty=%.6f price=%.4f", symbol, qty, market_price)
+            LOGGER.info(
+                "[PAPER] SELL %s qty=%.6f price=%.4f commission=%.4f net=%.4f",
+                symbol,
+                qty,
+                market_price,
+                commission_rub,
+                net_pnl,
+            )
+            execution = {
+                "side": side,
+                "qty": qty,
+                "filled_notional_rub": notional_rub,
+                "notional_rub": notional_rub,
+                "commission_rub": total_trade_commission_rub,
+                "commission_rate": self.settings.paper_commission_rate if self.settings.paper_include_commission else 0.0,
+                "gross_pnl": gross_pnl,
+                "gross_pnl_pct": gross_pnl_pct,
+                "net_pnl": net_pnl,
+                "net_pnl_pct": net_pnl_pct,
+                "entry_commission_allocated_rub": entry_commission_allocated_rub,
+                "exit_commission_rub": commission_rub,
+                "cash_after_rub": self.cash_rub,
+            }
+        else:
+            return None
         self._save({symbol: market_price})
+        return execution
 
     def performance(self, latest_prices: Dict[str, float]) -> Dict[str, Any]:
         return self.sync_balance_snapshot(latest_prices)
@@ -1184,7 +1310,9 @@ class PaperBroker:
         self.cash_rub = amount
         self.positions = {}
         self.avg_price = {}
-        self.realized_pnl_rub = 0.0
+        self.open_entry_commission_rub = {}
+        self.realized_gross_pnl_rub = 0.0
+        self.realized_commission_rub = 0.0
         self.trade_count = 0
         self._save({})
         return self.get_balance_snapshot({})
@@ -1895,11 +2023,44 @@ class SignalEngine:
             f"\n📈 С последнего reset: {format_rub(total)}"
         )
 
-    def _close_trade(self, symbol: str, exit_price: float, reason: str, qty: float, avg_price: float) -> None:
+    def _trade_result_lines(
+        self,
+        gross_pnl: float,
+        gross_pnl_pct: float,
+        commission_rub: float,
+        net_pnl: float,
+        net_pnl_pct: float,
+    ) -> str:
+        return (
+            f"\n📊 До комиссии: {format_close_pnl_line(gross_pnl, gross_pnl_pct)}"
+            f"\n💸 Комиссия: {format_signed_rub(-abs(commission_rub))}"
+            f"\n📈 Итог net: {format_close_pnl_line(net_pnl, net_pnl_pct)}"
+        )
+
+    def _close_trade(
+        self,
+        symbol: str,
+        exit_price: float,
+        reason: str,
+        qty: float,
+        avg_price: float,
+        execution: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self._pm_states.pop(symbol, None)
-        pnl = (exit_price - avg_price) * qty
-        pnl_pct = ((exit_price / avg_price) - 1.0) * 100 if avg_price > 0 else 0.0
-        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+        gross_pnl = safe_float(execution.get("gross_pnl")) if execution else (exit_price - avg_price) * qty
+        gross_pnl_pct = (
+            safe_float(execution.get("gross_pnl_pct"))
+            if execution and execution.get("gross_pnl_pct") is not None
+            else (((exit_price / avg_price) - 1.0) * 100 if avg_price > 0 else 0.0)
+        )
+        commission_rub = safe_float(execution.get("commission_rub")) if execution else 0.0
+        net_pnl = safe_float(execution.get("net_pnl")) if execution else gross_pnl - commission_rub
+        net_pnl_pct = (
+            safe_float(execution.get("net_pnl_pct"))
+            if execution and execution.get("net_pnl_pct") is not None
+            else gross_pnl_pct
+        )
+        pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
         meta = self.trade_meta.pop(symbol, None)
         signal_id = meta.get("signal_id") if meta else None
         local_trade_id = meta.get("local_trade_id") if meta else None
@@ -1916,8 +2077,9 @@ class SignalEngine:
             f"💵 Вход: {avg_price:.4f}\n"
             f"💵 Выход: {exit_price:.4f}\n"
             f"📦 Объем: {qty:.6f}\n"
-            f"{pnl_emoji} Результат: {format_close_pnl_line(pnl, pnl_pct)}"
+            f"{pnl_emoji} Результат сделки:"
         )
+        close_text += self._trade_result_lines(gross_pnl, gross_pnl_pct, commission_rub, net_pnl, net_pnl_pct)
         if adaptive_note:
             close_text += f"\n🧩 {adaptive_note}"
         close_text += balance_lines
@@ -1937,8 +2099,17 @@ class SignalEngine:
                         "qty": qty,
                         "avg_price": avg_price,
                         "exit_price": exit_price,
-                        "pnl": pnl,
-                        "pnl_pct": pnl_pct,
+                        "pnl": net_pnl,
+                        "pnl_pct": net_pnl_pct,
+                        "gross_pnl": gross_pnl,
+                        "gross_pnl_pct": gross_pnl_pct,
+                        "commission_rub": commission_rub,
+                        "net_pnl": net_pnl,
+                        "net_pnl_pct": net_pnl_pct,
+                        "commission_rate": self.settings.paper_commission_rate if self.settings.paper_include_commission else 0.0,
+                        "notional_rub": safe_float(execution.get("notional_rub")) if execution else qty * exit_price,
+                        "entry_commission_allocated_rub": safe_float(execution.get("entry_commission_allocated_rub")) if execution else 0.0,
+                        "exit_commission_rub": safe_float(execution.get("exit_commission_rub")) if execution else commission_rub,
                         "balance_after_rub": balance_after_rub,
                     },
                     decision_ts=self._iso_now(),
@@ -1966,7 +2137,10 @@ class SignalEngine:
                 f"💵 Цена выхода: {exit_price:.4f}\n"
                 f"📦 Объем: {qty:.6f}\n"
                 f"📌 Причина: {reason}\n"
-                f"{pnl_emoji} Результат: {format_close_pnl_line(pnl, pnl_pct)}"
+                f"{pnl_emoji} Результат сделки:"
+            )
+            closed_entry_text += self._trade_result_lines(
+                gross_pnl, gross_pnl_pct, commission_rub, net_pnl, net_pnl_pct
             )
             if adaptive_note:
                 closed_entry_text += f"\n🧩 {adaptive_note}"
@@ -2036,21 +2210,34 @@ class SignalEngine:
         qty_exit: float,
         reason_code: str,
         details: Dict[str, Any],
+        execution: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Частичное закрытие long: trade_meta не удаляем."""
         qty, avg_price = self.broker.get_position(symbol)
         if qty_exit <= 0 or qty <= 0:
             return
-        pnl = (exit_price - avg_price) * qty_exit
-        pnl_pct = ((exit_price / avg_price) - 1.0) * 100 if avg_price > 0 else 0.0
-        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+        gross_pnl = safe_float(execution.get("gross_pnl")) if execution else (exit_price - avg_price) * qty_exit
+        gross_pnl_pct = (
+            safe_float(execution.get("gross_pnl_pct"))
+            if execution and execution.get("gross_pnl_pct") is not None
+            else (((exit_price / avg_price) - 1.0) * 100 if avg_price > 0 else 0.0)
+        )
+        commission_rub = safe_float(execution.get("commission_rub")) if execution else 0.0
+        net_pnl = safe_float(execution.get("net_pnl")) if execution else gross_pnl - commission_rub
+        net_pnl_pct = (
+            safe_float(execution.get("net_pnl_pct"))
+            if execution and execution.get("net_pnl_pct") is not None
+            else gross_pnl_pct
+        )
+        pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
         balance_lines = self._balance_lines_for_message({**self.last_prices, symbol: exit_price})
         msg = (
             f"📊 {symbol} | ЧАСТИЧНЫЙ ВЫХОД ({reason_code})\n"
             f"💵 Средняя: {avg_price:.4f}  Выход: {exit_price:.4f}\n"
             f"📦 Объём: {qty_exit:.6f}\n"
-            f"{pnl_emoji} {format_close_pnl_line(pnl, pnl_pct)}"
+            f"{pnl_emoji} Результат:"
         )
+        msg += self._trade_result_lines(gross_pnl, gross_pnl_pct, commission_rub, net_pnl, net_pnl_pct)
         msg += balance_lines
         self.notifier.send(msg)
         meta = self.trade_meta.get(symbol, {})
@@ -2066,7 +2253,22 @@ class SignalEngine:
                     decision_label="PARTIAL_EXIT",
                     reason_code=reason_code,
                     reason_text="Partial exit (position management)",
-                    details={**details, "qty_exit": qty_exit, "exit_price": exit_price, "pnl": pnl, "pnl_pct": pnl_pct},
+                    details={
+                        **details,
+                        "qty_exit": qty_exit,
+                        "exit_price": exit_price,
+                        "pnl": net_pnl,
+                        "pnl_pct": net_pnl_pct,
+                        "gross_pnl": gross_pnl,
+                        "gross_pnl_pct": gross_pnl_pct,
+                        "commission_rub": commission_rub,
+                        "net_pnl": net_pnl,
+                        "net_pnl_pct": net_pnl_pct,
+                        "commission_rate": self.settings.paper_commission_rate if self.settings.paper_include_commission else 0.0,
+                        "notional_rub": safe_float(execution.get("notional_rub")) if execution else qty_exit * exit_price,
+                        "entry_commission_allocated_rub": safe_float(execution.get("entry_commission_allocated_rub")) if execution else 0.0,
+                        "exit_commission_rub": safe_float(execution.get("exit_commission_rub")) if execution else commission_rub,
+                    },
                     decision_ts=self._iso_now(),
                 )
             except Exception as exc:  # pylint: disable=broad-except
@@ -2169,8 +2371,8 @@ class SignalEngine:
                 if qty <= 0:
                     self._pm_states.pop(symbol, None)
                     return True
-                self.broker.place_order(symbol, "SELL", qty * price, price)
-                self._close_trade(symbol, price, f"PM:{ev.code}", qty, avg_price)
+                execution = self.broker.place_order(symbol, "SELL", qty * price, price)
+                self._close_trade(symbol, price, f"PM:{ev.code}", qty, avg_price, execution=execution)
                 self._last_close_bar_key[symbol] = bar_key
                 return True
             if ev.close_fraction > 0:
@@ -2179,8 +2381,8 @@ class SignalEngine:
                     continue
                 qty_close = qty * ev.close_fraction
                 amount_rub = qty_close * price
-                self.broker.place_order(symbol, "SELL", amount_rub, price)
-                self._partial_close_trade(symbol, price, qty_close, ev.code, ev.details)
+                execution = self.broker.place_order(symbol, "SELL", amount_rub, price)
+                self._partial_close_trade(symbol, price, qty_close, ev.code, ev.details, execution=execution)
                 q_new, _ = self.broker.get_position(symbol)
                 state.remaining_qty = q_new
 
@@ -2203,13 +2405,13 @@ class SignalEngine:
         tp_price = avg_price * (1.0 + self.strategy.take_profit_pct)
 
         if price <= sl_price:
-            self.broker.place_order(symbol, "SELL", qty * price, price)
-            self._close_trade(symbol, price, "Stop-loss", qty, avg_price)
+            execution = self.broker.place_order(symbol, "SELL", qty * price, price)
+            self._close_trade(symbol, price, "Stop-loss", qty, avg_price, execution=execution)
             self._last_close_bar_key[symbol] = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
             return True
         if price >= tp_price:
-            self.broker.place_order(symbol, "SELL", qty * price, price)
-            self._close_trade(symbol, price, "Take-profit", qty, avg_price)
+            execution = self.broker.place_order(symbol, "SELL", qty * price, price)
+            self._close_trade(symbol, price, "Take-profit", qty, avg_price, execution=execution)
             self._last_close_bar_key[symbol] = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
             return True
         return False
@@ -2271,13 +2473,15 @@ class SignalEngine:
             return "📈 Детальный P&L доступен только в paper-режиме."
         p = self.last_performance
         total = safe_float(p.get("total_pnl_rub", 0.0))
-        realized = safe_float(p.get("realized_pnl_rub", 0.0))
+        realized = safe_float(p.get("realized_net_pnl_rub", p.get("realized_pnl_rub", 0.0)))
+        commissions = safe_float(p.get("realized_commission_rub", 0.0))
         unrealized = safe_float(p.get("unrealized_pnl_rub", 0.0))
         total_emoji = "🟢" if total >= 0 else "🔴"
         return (
             "📈 Текущий P&L\n"
             f"{total_emoji} Общий P&L: {format_rub(total)}\n"
-            f"✅ Реализованный P&L: {format_rub(realized)}\n"
+            f"✅ Реализованный net P&L: {format_rub(realized)}\n"
+            f"💸 Комиссии: {format_rub(commissions)}\n"
             f"📌 Нереализованный P&L: {format_rub(unrealized)}\n"
             f"💼 Капитал: {format_rub(p.get('equity_rub', 0))}\n"
             f"💵 Кэш: {format_rub(p.get('cash_rub', 0))}"
@@ -2293,8 +2497,11 @@ class SignalEngine:
             "💰 Виртуальный баланс\n"
             f"🏁 Старт: {format_rub(snapshot.get('initial_balance_rub', 0))}\n"
             f"💼 Баланс: {format_rub(snapshot.get('current_balance_rub', 0))}\n"
-            f"✅ Реализовано: {format_rub(snapshot.get('realized_pnl_total_rub', 0))}\n"
+            f"📈 Realized gross: {format_rub(snapshot.get('realized_gross_pnl_rub', 0))}\n"
+            f"💸 Комиссии: {format_rub(snapshot.get('realized_commission_rub', 0))}\n"
+            f"✅ Realized net: {format_rub(snapshot.get('realized_net_pnl_rub', 0))}\n"
             f"📌 Нереализовано: {format_rub(snapshot.get('unrealized_pnl_rub', 0))}\n"
+            f"🏦 Equity: {format_rub(snapshot.get('equity_rub', 0))}\n"
             f"{total_emoji} С последнего reset: {format_rub(total)}\n"
             f"🕒 Reset: {snapshot.get('last_reset_at', 'n/a')}"
         )
@@ -2642,7 +2849,7 @@ class SignalEngine:
                     self.current_signals_found += 1
                     before_qty, _ = self.broker.get_position(symbol)
                     local_trade_id = str(uuid.uuid4())
-                    self.broker.place_order(
+                    execution = self.broker.place_order(
                         symbol=symbol,
                         side="BUY",
                         amount_rub=self.settings.position_size_rub,
@@ -2678,7 +2885,17 @@ class SignalEngine:
                                 decision_label="BUY",
                                 reason_code="ORDER_FILLED",
                                 reason_text="Paper/live order opened position.",
-                                details={"qty_after": after_qty, "avg_price": after_avg},
+                                details={
+                                    "qty_after": after_qty,
+                                    "avg_price": after_avg,
+                                    "gross_pnl": 0.0,
+                                    "gross_pnl_pct": 0.0,
+                                    "commission_rub": safe_float(execution.get("commission_rub")) if execution else 0.0,
+                                    "net_pnl": safe_float(execution.get("net_pnl")) if execution else 0.0,
+                                    "net_pnl_pct": safe_float(execution.get("net_pnl_pct")) if execution else 0.0,
+                                    "commission_rate": self.settings.paper_commission_rate if self.settings.paper_include_commission else 0.0,
+                                    "notional_rub": safe_float(execution.get("notional_rub")) if execution else snapshot.price * (after_qty - before_qty),
+                                },
                                 decision_ts=self._iso_now(),
                             )
                         if self.paper_mapper:
@@ -2704,7 +2921,7 @@ class SignalEngine:
                     self.current_signals_found += 1
                     if qty_before > 0:
                         open_signal_id = self.trade_meta.get(symbol, {}).get("signal_id")
-                        self.broker.place_order(
+                        execution = self.broker.place_order(
                             symbol=symbol,
                             side="SELL",
                             amount_rub=qty_before * snapshot.price,
@@ -2712,7 +2929,9 @@ class SignalEngine:
                         )
                         if self.analytics_logger:
                             self.analytics_logger.update_signal_status(open_signal_id, "CLOSING")
-                        self._close_trade(symbol, snapshot.price, "Сигнал стратегии", qty_before, avg_before)
+                        self._close_trade(
+                            symbol, snapshot.price, "Сигнал стратегии", qty_before, avg_before, execution=execution
+                        )
                         self._last_close_bar_key[symbol] = _bar_key_at(
                             datetime.now(timezone.utc), self.settings.interval
                         )
