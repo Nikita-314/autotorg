@@ -8,8 +8,8 @@ import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from threading import Thread
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from threading import Lock, Thread
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import requests
 import yfinance as yf
@@ -1368,6 +1368,9 @@ class TelegramCommandServer:
     BTN_PNL = "📈 P&L"
     BTN_BALANCE = "💰 Баланс"
     BTN_POSITIONS = "🧾 Позиции"
+    BTN_CLOSE_ALL = "🛑 Закрыть все позиции"
+    BTN_CONFIRM_CLOSE_ALL = "✅ Подтвердить закрытие всех позиций"
+    BTN_CANCEL_CLOSE_ALL = "❌ Отмена"
     BTN_HELP = "❓ Помощь"
 
     def __init__(
@@ -1380,6 +1383,8 @@ class TelegramCommandServer:
         positions_provider: Callable[[], str],
         balance_reset_handler: Callable[[Optional[float]], str],
         balance_set_handler: Callable[[float], str],
+        close_all_check_handler: Callable[[], Tuple[bool, str]],
+        close_all_execute_handler: Callable[[], str],
     ):
         self.token = settings.telegram_bot_token
         self.chat_id = settings.telegram_chat_id
@@ -1390,8 +1395,11 @@ class TelegramCommandServer:
         self.positions_provider = positions_provider
         self.balance_reset_handler = balance_reset_handler
         self.balance_set_handler = balance_set_handler
+        self.close_all_check_handler = close_all_check_handler
+        self.close_all_execute_handler = close_all_execute_handler
         self.default_balance_amount = settings.paper_initial_balance_rub
         self._thread: Optional[Thread] = None
+        self._pending_close_all_chats: Set[int] = set()
 
     def enabled(self) -> bool:
         return bool(self.token)
@@ -1405,16 +1413,37 @@ class TelegramCommandServer:
             keyboard=[
                 [KeyboardButton(text=self.BTN_STATUS), KeyboardButton(text=self.BTN_STRATEGY)],
                 [KeyboardButton(text=self.BTN_PNL), KeyboardButton(text=self.BTN_BALANCE)],
-                [KeyboardButton(text=self.BTN_POSITIONS)],
+                [KeyboardButton(text=self.BTN_POSITIONS), KeyboardButton(text=self.BTN_CLOSE_ALL)],
                 [KeyboardButton(text=self.BTN_HELP)],
             ],
             resize_keyboard=True,
             is_persistent=True,
             input_field_placeholder="Выберите действие",
         )
+        confirm_close_keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=self.BTN_CONFIRM_CLOSE_ALL)],
+                [KeyboardButton(text=self.BTN_CANCEL_CLOSE_ALL)],
+            ],
+            resize_keyboard=True,
+            is_persistent=False,
+            input_field_placeholder="Подтвердите массовое закрытие",
+        )
 
         async def send_keyboard(chat_id: str, text: str) -> None:
             await bot.send_message(chat_id=chat_id, text=text, reply_markup=actions_keyboard)
+
+        async def ask_close_all_confirmation(message: Message) -> None:
+            allowed, text = self.close_all_check_handler()
+            if not allowed:
+                self._pending_close_all_chats.discard(message.chat.id)
+                await message.answer(text, reply_markup=actions_keyboard)
+                return
+            self._pending_close_all_chats.add(message.chat.id)
+            await message.answer(
+                text + "\n\nПодтвердите массовое закрытие всех paper-позиций.",
+                reply_markup=confirm_close_keyboard,
+            )
 
         @router.message(CommandStart())
         async def command_start(message: Message) -> None:
@@ -1457,11 +1486,15 @@ class TelegramCommandServer:
         async def command_positions(message: Message) -> None:
             await message.answer(self.positions_provider())
 
+        @router.message(Command("close_all_positions"))
+        async def command_close_all_positions(message: Message) -> None:
+            await ask_close_all_confirmation(message)
+
         @router.message(Command("help"))
         async def command_help(message: Message) -> None:
             await message.answer(
                 "❓ Подсказка:\n"
-                "/status, /strategy, /pnl, /balance, /positions\n"
+                "/status, /strategy, /pnl, /balance, /positions, /close_all_positions\n"
                 "/balance_reset [amount], /balance_set <amount>\n"
                 "Используйте кнопки на клавиатуре ниже.",
                 reply_markup=actions_keyboard,
@@ -1487,11 +1520,28 @@ class TelegramCommandServer:
         async def button_positions(message: Message) -> None:
             await message.answer(self.positions_provider())
 
+        @router.message(F.text == self.BTN_CLOSE_ALL)
+        async def button_close_all(message: Message) -> None:
+            await ask_close_all_confirmation(message)
+
+        @router.message(F.text == self.BTN_CONFIRM_CLOSE_ALL)
+        async def button_confirm_close_all(message: Message) -> None:
+            if message.chat.id not in self._pending_close_all_chats:
+                await message.answer("🛑 Нет ожидающего подтверждения на закрытие позиций.", reply_markup=actions_keyboard)
+                return
+            self._pending_close_all_chats.discard(message.chat.id)
+            await message.answer(self.close_all_execute_handler(), reply_markup=actions_keyboard)
+
+        @router.message(F.text == self.BTN_CANCEL_CLOSE_ALL)
+        async def button_cancel_close_all(message: Message) -> None:
+            self._pending_close_all_chats.discard(message.chat.id)
+            await message.answer("Операция массового закрытия отменена.", reply_markup=actions_keyboard)
+
         @router.message(F.text == self.BTN_HELP)
         async def button_help(message: Message) -> None:
             await message.answer(
                 "❓ Подсказка:\n"
-                "/status, /strategy, /pnl, /balance, /positions\n"
+                "/status, /strategy, /pnl, /balance, /positions, /close_all_positions\n"
                 "/balance_reset [amount], /balance_set <amount>\n"
                 "Используйте кнопки на клавиатуре ниже.",
                 reply_markup=actions_keyboard,
@@ -1574,6 +1624,7 @@ class SignalEngine:
         self.current_run_id: Optional[str] = None
         self.current_signals_found = 0
         self.current_instruments_checked = 0
+        self._operator_lock = Lock()
         self._last_decision_meta: Dict[str, Dict[str, Any]] = {}
         # Защита от повторного BUY / re-entry на том же баре (UTC bucket по TV_INTERVAL)
         self._last_buy_bar_key: Dict[str, str] = {}
@@ -2045,6 +2096,8 @@ class SignalEngine:
         qty: float,
         avg_price: float,
         execution: Optional[Dict[str, Any]] = None,
+        close_reason_code: str = "CLOSE_TRADE",
+        extra_details: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._pm_states.pop(symbol, None)
         gross_pnl = safe_float(execution.get("gross_pnl")) if execution else (exit_price - avg_price) * qty
@@ -2093,7 +2146,7 @@ class SignalEngine:
                     ticker=symbol,
                     decision_type="TRADE_CLOSE",
                     decision_label="SELL",
-                    reason_code="CLOSE_TRADE",
+                    reason_code=close_reason_code,
                     reason_text=reason,
                     details={
                         "qty": qty,
@@ -2111,6 +2164,7 @@ class SignalEngine:
                         "entry_commission_allocated_rub": safe_float(execution.get("entry_commission_allocated_rub")) if execution else 0.0,
                         "exit_commission_rub": safe_float(execution.get("exit_commission_rub")) if execution else commission_rub,
                         "balance_after_rub": balance_after_rub,
+                        **(extra_details or {}),
                     },
                     decision_ts=self._iso_now(),
                 )
@@ -2507,36 +2561,38 @@ class SignalEngine:
         )
 
     def reset_balance(self, initial_balance_rub: Optional[float] = None) -> str:
-        if not isinstance(self.broker, PaperBroker):
-            return "💰 Сброс баланса доступен только в paper-режиме."
-        snapshot = self.broker.reset_balance(initial_balance_rub)
-        self.trade_meta = {}
-        self._pm_states = {}
-        self._pm_profiles = {}
-        self._last_buy_bar_key = {}
-        self._last_close_bar_key = {}
-        self.last_performance = snapshot
-        return (
-            "💰 Баланс сброшен.\n"
-            f"🏁 Новый старт: {format_rub(snapshot.get('initial_balance_rub', 0))}\n"
-            f"🕒 Reset: {snapshot.get('last_reset_at', 'n/a')}"
-        )
+        with self._operator_lock:
+            if not isinstance(self.broker, PaperBroker):
+                return "💰 Сброс баланса доступен только в paper-режиме."
+            snapshot = self.broker.reset_balance(initial_balance_rub)
+            self.trade_meta = {}
+            self._pm_states = {}
+            self._pm_profiles = {}
+            self._last_buy_bar_key = {}
+            self._last_close_bar_key = {}
+            self.last_performance = snapshot
+            return (
+                "💰 Баланс сброшен.\n"
+                f"🏁 Новый старт: {format_rub(snapshot.get('initial_balance_rub', 0))}\n"
+                f"🕒 Reset: {snapshot.get('last_reset_at', 'n/a')}"
+            )
 
     def set_balance(self, initial_balance_rub: float) -> str:
-        if not isinstance(self.broker, PaperBroker):
-            return "💰 Установка баланса доступна только в paper-режиме."
-        snapshot = self.broker.set_balance(initial_balance_rub)
-        self.trade_meta = {}
-        self._pm_states = {}
-        self._pm_profiles = {}
-        self._last_buy_bar_key = {}
-        self._last_close_bar_key = {}
-        self.last_performance = snapshot
-        return (
-            "💰 Стартовый баланс обновлён.\n"
-            f"🏁 Новый старт: {format_rub(snapshot.get('initial_balance_rub', 0))}\n"
-            f"🕒 Reset: {snapshot.get('last_reset_at', 'n/a')}"
-        )
+        with self._operator_lock:
+            if not isinstance(self.broker, PaperBroker):
+                return "💰 Установка баланса доступна только в paper-режиме."
+            snapshot = self.broker.set_balance(initial_balance_rub)
+            self.trade_meta = {}
+            self._pm_states = {}
+            self._pm_profiles = {}
+            self._last_buy_bar_key = {}
+            self._last_close_bar_key = {}
+            self.last_performance = snapshot
+            return (
+                "💰 Стартовый баланс обновлён.\n"
+                f"🏁 Новый старт: {format_rub(snapshot.get('initial_balance_rub', 0))}\n"
+                f"🕒 Reset: {snapshot.get('last_reset_at', 'n/a')}"
+            )
 
     def get_open_positions_text(self) -> str:
         if not isinstance(self.broker, PaperBroker):
@@ -2558,6 +2614,91 @@ class SignalEngine:
             lines.append(f"\n… и еще {len(positions) - 20} позиций")
         return "\n".join(lines)
 
+    def can_close_all_positions(self) -> Tuple[bool, str]:
+        if not isinstance(self.broker, PaperBroker) or self.settings.trading_mode != "paper":
+            return False, "🛑 Массовое закрытие доступно только в paper-режиме."
+        open_symbols = [symbol for symbol, qty in self.broker.positions.items() if safe_float(qty) > 0]
+        if not open_symbols:
+            return False, "🛑 Сейчас нет открытых paper-позиций. Закрывать нечего."
+        return True, f"🛑 Будут закрыты текущие paper-позиции: {len(open_symbols)}"
+
+    def close_all_positions(self) -> str:
+        with self._operator_lock:
+            allowed, text = self.can_close_all_positions()
+            if not allowed:
+                return text
+
+            symbols = [symbol for symbol, qty in self.broker.positions.items() if safe_float(qty) > 0]
+            closed = 0
+            errors: List[str] = []
+            gross_total = 0.0
+            commission_total = 0.0
+            net_total = 0.0
+
+            for symbol in list(symbols):
+                qty_before, avg_before = self.broker.get_position(symbol)
+                if qty_before <= 0:
+                    continue
+                try:
+                    snapshot = self.tv.get_snapshot(symbol)
+                    price = safe_float(snapshot.price)
+                    if price <= 0:
+                        raise RuntimeError("invalid market price")
+                    self.last_prices[symbol] = price
+                    execution = self.broker.place_order(
+                        symbol=symbol,
+                        side="SELL",
+                        amount_rub=qty_before * price,
+                        market_price=price,
+                    )
+                    if not execution:
+                        raise RuntimeError("paper execution returned empty result")
+                    open_signal_id = self.trade_meta.get(symbol, {}).get("signal_id")
+                    if self.analytics_logger:
+                        self.analytics_logger.update_signal_status(open_signal_id, "CLOSING")
+                    self._close_trade(
+                        symbol,
+                        price,
+                        "Manual close all",
+                        qty_before,
+                        avg_before,
+                        execution=execution,
+                        close_reason_code="MANUAL_CLOSE_ALL",
+                        extra_details={
+                            "manual_action": True,
+                            "operator_action": "close_all_positions",
+                        },
+                    )
+                    self._last_close_bar_key[symbol] = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
+                    closed += 1
+                    gross_total += safe_float(execution.get("gross_pnl"))
+                    commission_total += safe_float(execution.get("commission_rub"))
+                    net_total += safe_float(execution.get("net_pnl"))
+                except Exception as exc:  # pylint: disable=broad-except
+                    LOGGER.warning("Manual close-all failed for %s: %s", symbol, exc)
+                    errors.append(f"{symbol}: {exc}")
+
+            balance_snapshot = (
+                self.broker.get_balance_snapshot(self.last_prices)
+                if isinstance(self.broker, PaperBroker)
+                else {"current_balance_rub": 0.0}
+            )
+            summary = (
+                "🛑 Закрытие всех позиций завершено\n"
+                f"Всего к закрытию: {len(symbols)}\n"
+                f"Успешно закрыто: {closed}\n"
+                f"Ошибка: {len(errors)}\n"
+                f"Gross: {format_signed_rub(gross_total)}\n"
+                f"Комиссия: {format_signed_rub(-abs(commission_total))}\n"
+                f"Net: {format_signed_rub(net_total)}\n"
+                f"Баланс: {format_rub(balance_snapshot.get('current_balance_rub', 0))}"
+            )
+            if errors:
+                summary += "\n" + "\n".join([f"• {item}" for item in errors[:8]])
+                if len(errors) > 8:
+                    summary += f"\n… и еще {len(errors) - 8}"
+            return summary
+
     def _check_risk_exit(self, symbol: str, price: float, bar_key: str) -> bool:
         if not isinstance(self.broker, PaperBroker):
             return False
@@ -2577,415 +2718,416 @@ class SignalEngine:
         return self._legacy_risk_exit(symbol, price)
 
     def run_once(self) -> None:
-        self.cycle += 1
-        self.current_signals_found = 0
-        self.current_instruments_checked = 0
-        self.current_run_id = None
-        run_status = "OK"
-        run_comment = ""
-        if self.analytics_logger:
-            try:
-                self.current_run_id = self.analytics_logger.start_run(
-                    strategy_code=self.settings.strategy_mode,
-                    strategy_version=self.settings.analytics_strategy_version,
-                    universe_size=len(self.symbols),
-                    tradable_universe_size=len(self.symbols),
-                    comment=f"cycle={self.cycle}",
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                LOGGER.warning("Failed to start analytics run: %s", exc)
+        with self._operator_lock:
+            self.cycle += 1
+            self.current_signals_found = 0
+            self.current_instruments_checked = 0
+            self.current_run_id = None
+            run_status = "OK"
+            run_comment = ""
+            if self.analytics_logger:
+                try:
+                    self.current_run_id = self.analytics_logger.start_run(
+                        strategy_code=self.settings.strategy_mode,
+                        strategy_version=self.settings.analytics_strategy_version,
+                        universe_size=len(self.symbols),
+                        tradable_universe_size=len(self.symbols),
+                        comment=f"cycle={self.cycle}",
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    LOGGER.warning("Failed to start analytics run: %s", exc)
 
-        if self.cycle == 1 or self.cycle % self.settings.universe_refresh_cycles == 0:
-            self.refresh_universe()
-        if self.adaptive_engine is not None:
-            try:
-                self.adaptive_engine.refresh(self.cycle)
-            except Exception as exc:  # pylint: disable=broad-except
-                LOGGER.warning("Adaptive refresh failed: %s", exc)
+            if self.cycle == 1 or self.cycle % self.settings.universe_refresh_cycles == 0:
+                self.refresh_universe()
+            if self.adaptive_engine is not None:
+                try:
+                    self.adaptive_engine.refresh(self.cycle)
+                except Exception as exc:  # pylint: disable=broad-except
+                    LOGGER.warning("Adaptive refresh failed: %s", exc)
 
-        latest_prices: Dict[str, float] = {}
-        market_sample: List[Dict[str, Any]] = []
+            latest_prices: Dict[str, float] = {}
+            market_sample: List[Dict[str, Any]] = []
 
-        for symbol in self.symbols:
-            try:
-                if self.settings.strategy_mode == "supertrend_ml":
-                    result = self._decide_supertrend_ml(symbol)
-                    if result is None:
-                        continue
-                    action, score, snapshot = result
-                else:
-                    snapshot = self.tv.get_snapshot(symbol)
-                    score = self.scorer.score(snapshot, self.strategy)
-                    action = self.decide(score)
+            for symbol in self.symbols:
+                try:
+                    if self.settings.strategy_mode == "supertrend_ml":
+                        result = self._decide_supertrend_ml(symbol)
+                        if result is None:
+                            continue
+                        action, score, snapshot = result
+                    else:
+                        snapshot = self.tv.get_snapshot(symbol)
+                        score = self.scorer.score(snapshot, self.strategy)
+                        action = self.decide(score)
 
-                self.current_instruments_checked += 1
-                if snapshot.price < self.settings.min_price or snapshot.price > self.settings.max_price:
-                    if self.analytics_logger and self.settings.analytics_log_holds:
-                        self.analytics_logger.log_decision(
-                            run_id=self.current_run_id,
-                            signal_id=None,
-                            ticker=symbol,
-                            decision_type="STRATEGY_DECISION",
-                            decision_label="BLOCK",
-                            reason_code="OUT_OF_PRICE_RANGE",
-                            reason_text="Price outside configured min/max range.",
-                            details={"price": snapshot.price},
-                            decision_ts=self._iso_now(),
-                        )
-                    continue
-
-                bar_key_risk = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
-                risk_exit_triggered = self._check_risk_exit(symbol, snapshot.price, bar_key_risk)
-                if risk_exit_triggered:
-                    LOGGER.info("Risk exit for %s", symbol)
-                    self.last_prices[symbol] = snapshot.price
-                    continue
-
-                latest_prices[symbol] = snapshot.price
-                self.last_prices[symbol] = snapshot.price
-                market_sample.append(
-                    {
-                        "symbol": symbol,
-                        "price": snapshot.price,
-                        "score": round(score, 4),
-                        "rsi": round(snapshot.rsi, 2),
-                        "adx": round(snapshot.adx, 2),
-                    }
-                )
-
-                qty, _ = self.broker.get_position(symbol)
-                has_position = qty > 0
-                decision_meta = self._last_decision_meta.get(symbol, {})
-                feature_snapshot = decision_meta.get("feature_snapshot", {})
-                model_snapshot = decision_meta.get("model_snapshot", {})
-                reason_code = decision_meta.get("reason_code")
-                reason_text = decision_meta.get("reason_text")
-                market_regime = decision_meta.get("market_regime")
-
-                if has_position and action in ("BUY", "HOLD"):
-                    if self.analytics_logger and self.settings.analytics_log_holds:
-                        hold_signal_id = self.analytics_logger.log_signal(
-                            run_id=self.current_run_id,
-                            ticker=symbol,
-                            strategy_code=self.settings.strategy_mode,
-                            strategy_version=self.settings.analytics_strategy_version,
-                            side="HOLD",
-                            entry_price=snapshot.price,
-                            stop_price=None,
-                            target_price=None,
-                            confidence_score=self._safe_float_or_none(score),
-                            reason_code="HAS_OPEN_POSITION",
-                            reason_text="Ticker already has open position.",
-                            feature_snapshot=feature_snapshot,
-                            model_snapshot=model_snapshot,
-                            market_regime=market_regime,
-                            execution_mode=self.settings.trading_mode,
-                            status="HOLD",
-                            signal_ts=self._iso_now(),
-                        )
-                        self.analytics_logger.log_decision(
-                            run_id=self.current_run_id,
-                            signal_id=hold_signal_id,
-                            ticker=symbol,
-                            decision_type="STRATEGY_DECISION",
-                            decision_label="HOLD",
-                            reason_code="HAS_OPEN_POSITION",
-                            reason_text="Ticker already has open position.",
-                            details={"action": action},
-                            decision_ts=self._iso_now(),
-                        )
-                    continue
-                if not has_position and action == "SELL":
-                    if self.analytics_logger and self.settings.analytics_log_holds:
-                        block_signal_id = self.analytics_logger.log_signal(
-                            run_id=self.current_run_id,
-                            ticker=symbol,
-                            strategy_code=self.settings.strategy_mode,
-                            strategy_version=self.settings.analytics_strategy_version,
-                            side="BLOCK",
-                            entry_price=snapshot.price,
-                            stop_price=None,
-                            target_price=None,
-                            confidence_score=self._safe_float_or_none(score),
-                            reason_code="NO_OPEN_POSITION",
-                            reason_text="Sell signal ignored because there is no open position.",
-                            feature_snapshot=feature_snapshot,
-                            model_snapshot=model_snapshot,
-                            market_regime=market_regime,
-                            execution_mode=self.settings.trading_mode,
-                            status="BLOCK",
-                            signal_ts=self._iso_now(),
-                        )
-                        self.analytics_logger.log_decision(
-                            run_id=self.current_run_id,
-                            signal_id=block_signal_id,
-                            ticker=symbol,
-                            decision_type="STRATEGY_DECISION",
-                            decision_label="BLOCK",
-                            reason_code="NO_OPEN_POSITION",
-                            reason_text="Sell signal ignored because there is no open position.",
-                            details={"action": action},
-                            decision_ts=self._iso_now(),
-                        )
-                    continue
-                if action == "BUY" and not self.broker.can_afford_buy(self.settings.position_size_rub):
-                    if self.analytics_logger:
-                        block_signal_id = self.analytics_logger.log_signal(
-                            run_id=self.current_run_id,
-                            ticker=symbol,
-                            strategy_code=self.settings.strategy_mode,
-                            strategy_version=self.settings.analytics_strategy_version,
-                            side="BLOCK",
-                            entry_price=snapshot.price,
-                            stop_price=None,
-                            target_price=None,
-                            confidence_score=self._safe_float_or_none(score),
-                            reason_code="INSUFFICIENT_CASH",
-                            reason_text="Cannot afford new buy by position sizing rule.",
-                            feature_snapshot=feature_snapshot,
-                            model_snapshot=model_snapshot,
-                            market_regime=market_regime,
-                            execution_mode=self.settings.trading_mode,
-                            status="BLOCK",
-                            signal_ts=self._iso_now(),
-                        )
-                        self.analytics_logger.log_decision(
-                            run_id=self.current_run_id,
-                            signal_id=block_signal_id,
-                            ticker=symbol,
-                            decision_type="STRATEGY_DECISION",
-                            decision_label="BLOCK",
-                            reason_code="INSUFFICIENT_CASH",
-                            reason_text="Cannot afford new buy by position sizing rule.",
-                            details={"required_rub": self.settings.position_size_rub},
-                            decision_ts=self._iso_now(),
-                        )
-                    continue
-
-                bar_key_buy: Optional[str] = None
-                if action == "BUY":
-                    bar_key_buy = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
-                    if (
-                        self._last_buy_bar_key.get(symbol) == bar_key_buy
-                        or self._last_close_bar_key.get(symbol) == bar_key_buy
-                    ):
-                        LOGGER.info("ENTRY SKIPPED: already traded on this bar [%s]", symbol)
-                        if self.analytics_logger:
+                    self.current_instruments_checked += 1
+                    if snapshot.price < self.settings.min_price or snapshot.price > self.settings.max_price:
+                        if self.analytics_logger and self.settings.analytics_log_holds:
                             self.analytics_logger.log_decision(
                                 run_id=self.current_run_id,
                                 signal_id=None,
                                 ticker=symbol,
                                 decision_type="STRATEGY_DECISION",
-                                decision_label="SKIP",
-                                reason_code="SAME_BAR_REENTRY",
-                                reason_text="ENTRY SKIPPED: already traded on this bar",
-                                details={
-                                    "bar_key": bar_key_buy,
-                                    "interval": self.settings.interval,
-                                },
+                                decision_label="BLOCK",
+                                reason_code="OUT_OF_PRICE_RANGE",
+                                reason_text="Price outside configured min/max range.",
+                                details={"price": snapshot.price},
                                 decision_ts=self._iso_now(),
                             )
                         continue
 
-                signal_id: Optional[str] = None
-                adaptive_meta = decision_meta.get("adaptive_decision") if decision_meta else None
-                if self.analytics_logger and (action in ("BUY", "SELL") or self.settings.analytics_log_holds):
-                    stop_price = None
-                    target_price = None
-                    status = "OPEN" if action == "BUY" else "CLOSE_SIGNAL" if action == "SELL" else "HOLD"
-                    if action == "BUY":
-                        stop_price = snapshot.price * (1.0 - self.strategy.stop_loss_pct)
-                        target_price = snapshot.price * (1.0 + self.strategy.take_profit_pct)
-                    signal_id = self.analytics_logger.log_signal(
-                        run_id=self.current_run_id,
-                        ticker=symbol,
-                        strategy_code=self.settings.strategy_mode,
-                        strategy_version=self.settings.analytics_strategy_version,
-                        side=action,
-                        entry_price=snapshot.price,
-                        stop_price=stop_price,
-                        target_price=target_price,
-                        confidence_score=self._safe_float_or_none(score),
-                        reason_code=reason_code,
-                        reason_text=reason_text,
-                        feature_snapshot=feature_snapshot,
-                        model_snapshot=model_snapshot,
-                        market_regime=market_regime,
-                        execution_mode=self.settings.trading_mode,
-                        status=status,
-                        signal_ts=self._iso_now(),
-                    )
-                    self.analytics_logger.log_decision(
-                        run_id=self.current_run_id,
-                        signal_id=signal_id,
-                        ticker=symbol,
-                        decision_type="STRATEGY_DECISION",
-                        decision_label=action,
-                        reason_code=reason_code,
-                        reason_text=reason_text,
-                        details={
-                            "score": score,
+                    bar_key_risk = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
+                    risk_exit_triggered = self._check_risk_exit(symbol, snapshot.price, bar_key_risk)
+                    if risk_exit_triggered:
+                        LOGGER.info("Risk exit for %s", symbol)
+                        self.last_prices[symbol] = snapshot.price
+                        continue
+
+                    latest_prices[symbol] = snapshot.price
+                    self.last_prices[symbol] = snapshot.price
+                    market_sample.append(
+                        {
+                            "symbol": symbol,
                             "price": snapshot.price,
-                            "strategy_mode": self.settings.strategy_mode,
-                            "adaptive_mode": self.settings.adaptive_mode,
-                            "adaptive_decision": adaptive_meta,
-                        },
-                        decision_ts=self._iso_now(),
+                            "score": round(score, 4),
+                            "rsi": round(snapshot.rsi, 2),
+                            "adx": round(snapshot.adx, 2),
+                        }
                     )
-                    if self.adaptive_engine is not None and adaptive_meta is not None:
-                        try:
-                            self.adaptive_engine.log_signal_adaptation(
-                                signal_id=signal_id,
+
+                    qty, _ = self.broker.get_position(symbol)
+                    has_position = qty > 0
+                    decision_meta = self._last_decision_meta.get(symbol, {})
+                    feature_snapshot = decision_meta.get("feature_snapshot", {})
+                    model_snapshot = decision_meta.get("model_snapshot", {})
+                    reason_code = decision_meta.get("reason_code")
+                    reason_text = decision_meta.get("reason_text")
+                    market_regime = decision_meta.get("market_regime")
+
+                    if has_position and action in ("BUY", "HOLD"):
+                        if self.analytics_logger and self.settings.analytics_log_holds:
+                            hold_signal_id = self.analytics_logger.log_signal(
                                 run_id=self.current_run_id,
                                 ticker=symbol,
-                                decision=AdaptiveDecision(**adaptive_meta),
+                                strategy_code=self.settings.strategy_mode,
+                                strategy_version=self.settings.analytics_strategy_version,
+                                side="HOLD",
+                                entry_price=snapshot.price,
+                                stop_price=None,
+                                target_price=None,
+                                confidence_score=self._safe_float_or_none(score),
+                                reason_code="HAS_OPEN_POSITION",
+                                reason_text="Ticker already has open position.",
+                                feature_snapshot=feature_snapshot,
+                                model_snapshot=model_snapshot,
+                                market_regime=market_regime,
+                                execution_mode=self.settings.trading_mode,
+                                status="HOLD",
+                                signal_ts=self._iso_now(),
                             )
-                        except Exception as exc:  # pylint: disable=broad-except
-                            LOGGER.warning("Adaptive signal log failed for %s: %s", symbol, exc)
-
-                LOGGER.info("Symbol=%s price=%.4f score=%.3f action=%s", symbol, snapshot.price, score, action)
-
-                if action == "BUY":
-                    self.current_signals_found += 1
-                    before_qty, _ = self.broker.get_position(symbol)
-                    local_trade_id = str(uuid.uuid4())
-                    execution = self.broker.place_order(
-                        symbol=symbol,
-                        side="BUY",
-                        amount_rub=self.settings.position_size_rub,
-                        market_price=snapshot.price,
-                    )
-                    after_qty, after_avg = self.broker.get_position(symbol)
-                    if after_qty > before_qty:
-                        if bar_key_buy is not None:
-                            self._last_buy_bar_key[symbol] = bar_key_buy
-                        sl_price = after_avg * (1.0 - self.strategy.stop_loss_pct)
-                        tp_price = after_avg * (1.0 + self.strategy.take_profit_pct)
-                        adaptive_note = self._adaptive_note_from_meta(adaptive_meta)
-                        entry_message = self._format_entry_message(
-                            symbol, score, snapshot, sl_price, tp_price, adaptive_note=adaptive_note
-                        )
-                        entry_message_id = self.notifier.send(entry_message)
-                        self.trade_meta[symbol] = {
-                            "entry_price": after_avg,
-                            "entry_message_id": entry_message_id,
-                            "sl_price": sl_price,
-                            "tp_price": tp_price,
-                            "signal_id": signal_id,
-                            "local_trade_id": local_trade_id,
-                            "entry_bar_key": bar_key_buy,
-                            "adaptive_note": adaptive_note,
-                        }
-                        if self.analytics_logger:
                             self.analytics_logger.log_decision(
                                 run_id=self.current_run_id,
-                                signal_id=signal_id,
+                                signal_id=hold_signal_id,
                                 ticker=symbol,
-                                decision_type="TRADE_OPEN",
-                                decision_label="BUY",
-                                reason_code="ORDER_FILLED",
-                                reason_text="Paper/live order opened position.",
-                                details={
-                                    "qty_after": after_qty,
-                                    "avg_price": after_avg,
-                                    "gross_pnl": 0.0,
-                                    "gross_pnl_pct": 0.0,
-                                    "commission_rub": safe_float(execution.get("commission_rub")) if execution else 0.0,
-                                    "net_pnl": safe_float(execution.get("net_pnl")) if execution else 0.0,
-                                    "net_pnl_pct": safe_float(execution.get("net_pnl_pct")) if execution else 0.0,
-                                    "commission_rate": self.settings.paper_commission_rate if self.settings.paper_include_commission else 0.0,
-                                    "notional_rub": safe_float(execution.get("notional_rub")) if execution else snapshot.price * (after_qty - before_qty),
-                                },
+                                decision_type="STRATEGY_DECISION",
+                                decision_label="HOLD",
+                                reason_code="HAS_OPEN_POSITION",
+                                reason_text="Ticker already has open position.",
+                                details={"action": action},
                                 decision_ts=self._iso_now(),
                             )
-                        if self.paper_mapper:
-                            self.paper_mapper.map_open(
-                                signal_id=signal_id,
-                                local_trade_id=local_trade_id,
+                        continue
+
+                    if not has_position and action == "SELL":
+                        if self.analytics_logger and self.settings.analytics_log_holds:
+                            block_signal_id = self.analytics_logger.log_signal(
+                                run_id=self.current_run_id,
                                 ticker=symbol,
-                                qty=after_qty - before_qty,
-                                price=snapshot.price,
-                                comment="strategy_buy",
+                                strategy_code=self.settings.strategy_mode,
+                                strategy_version=self.settings.analytics_strategy_version,
+                                side="BLOCK",
+                                entry_price=snapshot.price,
+                                stop_price=None,
+                                target_price=None,
+                                confidence_score=self._safe_float_or_none(score),
+                                reason_code="NO_OPEN_POSITION",
+                                reason_text="Sell signal ignored because there is no open position.",
+                                feature_snapshot=feature_snapshot,
+                                model_snapshot=model_snapshot,
+                                market_regime=market_regime,
+                                execution_mode=self.settings.trading_mode,
+                                status="BLOCK",
+                                signal_ts=self._iso_now(),
                             )
-                        self._maybe_init_position_management(
-                            symbol, after_avg, after_qty, bar_key_buy
-                        )
-                elif action == "SELL":
-                    qty_before, avg_before = self.broker.get_position(symbol)
-                    if qty_before > 0:
-                        bar_key_exit = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
-                        entry_bar_key = self.trade_meta.get(symbol, {}).get("entry_bar_key")
-                        if entry_bar_key is not None and entry_bar_key == bar_key_exit:
-                            LOGGER.info("EXIT SKIPPED: same bar as entry [%s]", symbol)
+                            self.analytics_logger.log_decision(
+                                run_id=self.current_run_id,
+                                signal_id=block_signal_id,
+                                ticker=symbol,
+                                decision_type="STRATEGY_DECISION",
+                                decision_label="BLOCK",
+                                reason_code="NO_OPEN_POSITION",
+                                reason_text="Sell signal ignored because there is no open position.",
+                                details={"action": action},
+                                decision_ts=self._iso_now(),
+                            )
+                        continue
+
+                    if action == "BUY" and not self.broker.can_afford_buy(self.settings.position_size_rub):
+                        if self.analytics_logger:
+                            block_signal_id = self.analytics_logger.log_signal(
+                                run_id=self.current_run_id,
+                                ticker=symbol,
+                                strategy_code=self.settings.strategy_mode,
+                                strategy_version=self.settings.analytics_strategy_version,
+                                side="BLOCK",
+                                entry_price=snapshot.price,
+                                stop_price=None,
+                                target_price=None,
+                                confidence_score=self._safe_float_or_none(score),
+                                reason_code="INSUFFICIENT_CASH",
+                                reason_text="Cannot afford new buy by position sizing rule.",
+                                feature_snapshot=feature_snapshot,
+                                model_snapshot=model_snapshot,
+                                market_regime=market_regime,
+                                execution_mode=self.settings.trading_mode,
+                                status="BLOCK",
+                                signal_ts=self._iso_now(),
+                            )
+                            self.analytics_logger.log_decision(
+                                run_id=self.current_run_id,
+                                signal_id=block_signal_id,
+                                ticker=symbol,
+                                decision_type="STRATEGY_DECISION",
+                                decision_label="BLOCK",
+                                reason_code="INSUFFICIENT_CASH",
+                                reason_text="Cannot afford new buy by position sizing rule.",
+                                details={"required_rub": self.settings.position_size_rub},
+                                decision_ts=self._iso_now(),
+                            )
+                        continue
+
+                    bar_key_buy: Optional[str] = None
+                    if action == "BUY":
+                        bar_key_buy = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
+                        if (
+                            self._last_buy_bar_key.get(symbol) == bar_key_buy
+                            or self._last_close_bar_key.get(symbol) == bar_key_buy
+                        ):
+                            LOGGER.info("ENTRY SKIPPED: already traded on this bar [%s]", symbol)
+                            if self.analytics_logger:
+                                self.analytics_logger.log_decision(
+                                    run_id=self.current_run_id,
+                                    signal_id=None,
+                                    ticker=symbol,
+                                    decision_type="STRATEGY_DECISION",
+                                    decision_label="SKIP",
+                                    reason_code="SAME_BAR_REENTRY",
+                                    reason_text="ENTRY SKIPPED: already traded on this bar",
+                                    details={
+                                        "bar_key": bar_key_buy,
+                                        "interval": self.settings.interval,
+                                    },
+                                    decision_ts=self._iso_now(),
+                                )
                             continue
-                    self.current_signals_found += 1
-                    if qty_before > 0:
-                        open_signal_id = self.trade_meta.get(symbol, {}).get("signal_id")
+
+                    signal_id: Optional[str] = None
+                    adaptive_meta = decision_meta.get("adaptive_decision") if decision_meta else None
+                    if self.analytics_logger and (action in ("BUY", "SELL") or self.settings.analytics_log_holds):
+                        stop_price = None
+                        target_price = None
+                        status = "OPEN" if action == "BUY" else "CLOSE_SIGNAL" if action == "SELL" else "HOLD"
+                        if action == "BUY":
+                            stop_price = snapshot.price * (1.0 - self.strategy.stop_loss_pct)
+                            target_price = snapshot.price * (1.0 + self.strategy.take_profit_pct)
+                        signal_id = self.analytics_logger.log_signal(
+                            run_id=self.current_run_id,
+                            ticker=symbol,
+                            strategy_code=self.settings.strategy_mode,
+                            strategy_version=self.settings.analytics_strategy_version,
+                            side=action,
+                            entry_price=snapshot.price,
+                            stop_price=stop_price,
+                            target_price=target_price,
+                            confidence_score=self._safe_float_or_none(score),
+                            reason_code=reason_code,
+                            reason_text=reason_text,
+                            feature_snapshot=feature_snapshot,
+                            model_snapshot=model_snapshot,
+                            market_regime=market_regime,
+                            execution_mode=self.settings.trading_mode,
+                            status=status,
+                            signal_ts=self._iso_now(),
+                        )
+                        self.analytics_logger.log_decision(
+                            run_id=self.current_run_id,
+                            signal_id=signal_id,
+                            ticker=symbol,
+                            decision_type="STRATEGY_DECISION",
+                            decision_label=action,
+                            reason_code=reason_code,
+                            reason_text=reason_text,
+                            details={
+                                "score": score,
+                                "price": snapshot.price,
+                                "strategy_mode": self.settings.strategy_mode,
+                                "adaptive_mode": self.settings.adaptive_mode,
+                                "adaptive_decision": adaptive_meta,
+                            },
+                            decision_ts=self._iso_now(),
+                        )
+                        if self.adaptive_engine is not None and adaptive_meta is not None:
+                            try:
+                                self.adaptive_engine.log_signal_adaptation(
+                                    signal_id=signal_id,
+                                    run_id=self.current_run_id,
+                                    ticker=symbol,
+                                    decision=AdaptiveDecision(**adaptive_meta),
+                                )
+                            except Exception as exc:  # pylint: disable=broad-except
+                                LOGGER.warning("Adaptive signal log failed for %s: %s", symbol, exc)
+
+                    LOGGER.info("Symbol=%s price=%.4f score=%.3f action=%s", symbol, snapshot.price, score, action)
+
+                    if action == "BUY":
+                        self.current_signals_found += 1
+                        before_qty, _ = self.broker.get_position(symbol)
+                        local_trade_id = str(uuid.uuid4())
                         execution = self.broker.place_order(
                             symbol=symbol,
-                            side="SELL",
-                            amount_rub=qty_before * snapshot.price,
+                            side="BUY",
+                            amount_rub=self.settings.position_size_rub,
                             market_price=snapshot.price,
                         )
-                        if self.analytics_logger:
-                            self.analytics_logger.update_signal_status(open_signal_id, "CLOSING")
-                        self._close_trade(
-                            symbol, snapshot.price, "Сигнал стратегии", qty_before, avg_before, execution=execution
-                        )
-                        self._last_close_bar_key[symbol] = _bar_key_at(
-                            datetime.now(timezone.utc), self.settings.interval
-                        )
-                elif self.notifier.notify_hold:
-                    self.notifier.send(self._format_message(symbol, action, score, snapshot))
-            except Exception as exc:  # pylint: disable=broad-except
-                LOGGER.warning("Failed for %s: %s", symbol, exc)
-                run_status = "ERROR"
-                run_comment = f"{symbol}:{exc}"
-            time.sleep(self.settings.tv_request_delay_sec)
+                        after_qty, after_avg = self.broker.get_position(symbol)
+                        if after_qty > before_qty:
+                            if bar_key_buy is not None:
+                                self._last_buy_bar_key[symbol] = bar_key_buy
+                            sl_price = after_avg * (1.0 - self.strategy.stop_loss_pct)
+                            tp_price = after_avg * (1.0 + self.strategy.take_profit_pct)
+                            adaptive_note = self._adaptive_note_from_meta(adaptive_meta)
+                            entry_message = self._format_entry_message(
+                                symbol, score, snapshot, sl_price, tp_price, adaptive_note=adaptive_note
+                            )
+                            entry_message_id = self.notifier.send(entry_message)
+                            self.trade_meta[symbol] = {
+                                "entry_price": after_avg,
+                                "entry_message_id": entry_message_id,
+                                "sl_price": sl_price,
+                                "tp_price": tp_price,
+                                "signal_id": signal_id,
+                                "local_trade_id": local_trade_id,
+                                "entry_bar_key": bar_key_buy,
+                                "adaptive_note": adaptive_note,
+                            }
+                            if self.analytics_logger:
+                                self.analytics_logger.log_decision(
+                                    run_id=self.current_run_id,
+                                    signal_id=signal_id,
+                                    ticker=symbol,
+                                    decision_type="TRADE_OPEN",
+                                    decision_label="BUY",
+                                    reason_code="ORDER_FILLED",
+                                    reason_text="Paper/live order opened position.",
+                                    details={
+                                        "qty_after": after_qty,
+                                        "avg_price": after_avg,
+                                        "gross_pnl": 0.0,
+                                        "gross_pnl_pct": 0.0,
+                                        "commission_rub": safe_float(execution.get("commission_rub")) if execution else 0.0,
+                                        "net_pnl": safe_float(execution.get("net_pnl")) if execution else 0.0,
+                                        "net_pnl_pct": safe_float(execution.get("net_pnl_pct")) if execution else 0.0,
+                                        "commission_rate": self.settings.paper_commission_rate if self.settings.paper_include_commission else 0.0,
+                                        "notional_rub": safe_float(execution.get("notional_rub")) if execution else snapshot.price * (after_qty - before_qty),
+                                    },
+                                    decision_ts=self._iso_now(),
+                                )
+                            if self.paper_mapper:
+                                self.paper_mapper.map_open(
+                                    signal_id=signal_id,
+                                    local_trade_id=local_trade_id,
+                                    ticker=symbol,
+                                    qty=after_qty - before_qty,
+                                    price=snapshot.price,
+                                    comment="strategy_buy",
+                                )
+                            self._maybe_init_position_management(symbol, after_avg, after_qty, bar_key_buy)
+                    elif action == "SELL":
+                        qty_before, avg_before = self.broker.get_position(symbol)
+                        if qty_before > 0:
+                            bar_key_exit = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
+                            entry_bar_key = self.trade_meta.get(symbol, {}).get("entry_bar_key")
+                            if entry_bar_key is not None and entry_bar_key == bar_key_exit:
+                                LOGGER.info("EXIT SKIPPED: same bar as entry [%s]", symbol)
+                                continue
+                        self.current_signals_found += 1
+                        if qty_before > 0:
+                            open_signal_id = self.trade_meta.get(symbol, {}).get("signal_id")
+                            execution = self.broker.place_order(
+                                symbol=symbol,
+                                side="SELL",
+                                amount_rub=qty_before * snapshot.price,
+                                market_price=snapshot.price,
+                            )
+                            if self.analytics_logger:
+                                self.analytics_logger.update_signal_status(open_signal_id, "CLOSING")
+                            self._close_trade(
+                                symbol, snapshot.price, "Сигнал стратегии", qty_before, avg_before, execution=execution
+                            )
+                            self._last_close_bar_key[symbol] = _bar_key_at(
+                                datetime.now(timezone.utc), self.settings.interval
+                            )
+                    elif self.notifier.notify_hold:
+                        self.notifier.send(self._format_message(symbol, action, score, snapshot))
+                except Exception as exc:  # pylint: disable=broad-except
+                    LOGGER.warning("Failed for %s: %s", symbol, exc)
+                    run_status = "ERROR"
+                    run_comment = f"{symbol}:{exc}"
+                time.sleep(self.settings.tv_request_delay_sec)
 
-        valuation_prices = dict(self.last_prices)
-        valuation_prices.update(latest_prices)
-        performance = (
-            self.broker.performance(valuation_prices)
-            if isinstance(self.broker, PaperBroker)
-            else {"mode": self.settings.trading_mode}
-        )
-        if isinstance(self.broker, PaperBroker):
-            LOGGER.info("[PAPER] %s", performance)
-        self.last_performance = performance
+            valuation_prices = dict(self.last_prices)
+            valuation_prices.update(latest_prices)
+            performance = (
+                self.broker.performance(valuation_prices)
+                if isinstance(self.broker, PaperBroker)
+                else {"mode": self.settings.trading_mode}
+            )
+            if isinstance(self.broker, PaperBroker):
+                LOGGER.info("[PAPER] %s", performance)
+            self.last_performance = performance
 
-        new_strategy, ai_change_message = self.advisor.maybe_update(
-            cycle=self.cycle,
-            strategy=self.strategy,
-            performance=performance,
-            market_sample=market_sample,
-        )
-        self.strategy = new_strategy
-        if ai_change_message:
-            self.notifier.send(ai_change_message)
-        if self.outcome_evaluator and self.settings.analytics_outcome_eval_enabled:
-            try:
-                updated = self.outcome_evaluator.evaluate_pending(
-                    load_candles_fn=lambda ticker: load_candles(
-                        ticker, self.settings.exchange, self.settings.interval
-                    ),
-                    limit=200,
-                )
-                if updated:
-                    LOGGER.info("Analytics outcomes evaluated: %d", updated)
-            except Exception as exc:  # pylint: disable=broad-except
-                LOGGER.warning("Outcome evaluator failed: %s", exc)
-        if self.analytics_logger and self.current_run_id:
-            try:
-                self.analytics_logger.finish_run(
-                    run_id=self.current_run_id,
-                    instruments_checked=self.current_instruments_checked,
-                    signals_found=self.current_signals_found,
-                    run_status=run_status,
-                    comment=run_comment,
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                LOGGER.warning("Failed to finish analytics run: %s", exc)
+            new_strategy, ai_change_message = self.advisor.maybe_update(
+                cycle=self.cycle,
+                strategy=self.strategy,
+                performance=performance,
+                market_sample=market_sample,
+            )
+            self.strategy = new_strategy
+            if ai_change_message:
+                self.notifier.send(ai_change_message)
+            if self.outcome_evaluator and self.settings.analytics_outcome_eval_enabled:
+                try:
+                    updated = self.outcome_evaluator.evaluate_pending(
+                        load_candles_fn=lambda ticker: load_candles(
+                            ticker, self.settings.exchange, self.settings.interval
+                        ),
+                        limit=200,
+                    )
+                    if updated:
+                        LOGGER.info("Analytics outcomes evaluated: %d", updated)
+                except Exception as exc:  # pylint: disable=broad-except
+                    LOGGER.warning("Outcome evaluator failed: %s", exc)
+            if self.analytics_logger and self.current_run_id:
+                try:
+                    self.analytics_logger.finish_run(
+                        run_id=self.current_run_id,
+                        instruments_checked=self.current_instruments_checked,
+                        signals_found=self.current_signals_found,
+                        run_status=run_status,
+                        comment=run_comment,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    LOGGER.warning("Failed to finish analytics run: %s", exc)
 
 
 def main() -> None:
@@ -3036,6 +3178,18 @@ def main() -> None:
             return "⏳ Бот инициализируется, подождите..."
         return current.set_balance(amount)
 
+    def close_all_check_handler() -> Tuple[bool, str]:
+        current = engine_ref["engine"]
+        if current is None:
+            return False, "⏳ Бот инициализируется, подождите..."
+        return current.can_close_all_positions()
+
+    def close_all_execute_handler() -> str:
+        current = engine_ref["engine"]
+        if current is None:
+            return "⏳ Бот инициализируется, подождите..."
+        return current.close_all_positions()
+
     command_server = TelegramCommandServer(
         settings,
         status_provider,
@@ -3045,12 +3199,14 @@ def main() -> None:
         positions_provider,
         balance_reset_handler,
         balance_set_handler,
+        close_all_check_handler,
+        close_all_execute_handler,
     )
     if command_server.enabled():
         command_server.start()
         LOGGER.info(
             "Telegram commands enabled (/start, /status, /strategy, /pnl, /balance, "
-            "/balance_reset, /balance_set, /positions, /help)."
+            "/balance_reset, /balance_set, /positions, /close_all_positions, /help)."
         )
 
     engine = SignalEngine(settings)
