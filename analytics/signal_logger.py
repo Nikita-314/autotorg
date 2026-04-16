@@ -283,3 +283,49 @@ class SignalLogger:
         )
         return link_id
 
+    def log_adaptation_action(
+        self,
+        mode: str,
+        scope: str,
+        parameter_name: str,
+        action_status: str,
+        reason_text: str,
+        bucket_key: Optional[str] = None,
+        old_value: Optional[float] = None,
+        new_value: Optional[float] = None,
+        confidence_score: Optional[float] = None,
+        sample_size: Optional[int] = None,
+        metrics: Optional[Dict[str, Any]] = None,
+        window_summary: Optional[Dict[str, Any]] = None,
+        action_ts: Optional[str] = None,
+    ) -> str:
+        action_id = str(uuid.uuid4())
+        now = _now_iso()
+        self.db.execute(
+            """
+            INSERT INTO adaptive_actions (
+              action_id, action_ts, mode, scope, bucket_key, parameter_name,
+              old_value, new_value, confidence_score, sample_size,
+              action_status, reason_text, metrics_json, window_summary_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                action_id,
+                action_ts or now,
+                mode,
+                scope,
+                bucket_key,
+                parameter_name,
+                old_value,
+                new_value,
+                confidence_score,
+                sample_size,
+                action_status,
+                reason_text,
+                self.db.dumps_json(metrics or {}),
+                self.db.dumps_json(window_summary or {}),
+                now,
+            ),
+        )
+        return action_id
+

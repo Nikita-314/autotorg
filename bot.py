@@ -31,6 +31,7 @@ from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 from openai import OpenAI
 from tradingview_ta import Interval, TA_Handler
+from adaptive_analysis import AdaptiveAnalysisEngine, AdaptiveDecision
 
 
 def _setup_logging() -> None:
@@ -461,6 +462,7 @@ class Settings:
     trading_mode: str
     paper_initial_balance_rub: float
     paper_state_file: str
+    paper_balance_state_file: str
     bcs_stocks_api_url: str
     bcs_stocks_cache_file: str
     universe_refresh_cycles: int
@@ -488,6 +490,14 @@ class Settings:
     analytics_outcome_eval_enabled: bool
     # position_mgmt_mode: off | shadow | paper — многоуровневое сопровождение (только paper execution)
     position_mgmt_mode: str
+    adaptive_mode: str
+    adaptive_state_file: str
+    adaptive_lookback_days: int
+    adaptive_refresh_cycles: int
+    adaptive_min_observations: int
+    adaptive_negative_outcome_pct: float
+    adaptive_positive_outcome_pct: float
+    adaptive_max_threshold_delta_frac: float
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -507,8 +517,9 @@ class Settings:
             min_price=float(os.getenv("MIN_PRICE", "10")),
             max_price=float(os.getenv("MAX_PRICE", "1000000")),
             trading_mode=os.getenv("TRADING_MODE", "paper").strip().lower(),
-            paper_initial_balance_rub=float(os.getenv("PAPER_INITIAL_BALANCE_RUB", "100000")),
+            paper_initial_balance_rub=float(os.getenv("PAPER_INITIAL_BALANCE_RUB", "50000")),
             paper_state_file=os.getenv("PAPER_STATE_FILE", "paper_state.json"),
+            paper_balance_state_file=os.getenv("PAPER_BALANCE_STATE_FILE", "paper_balance_state.json"),
             bcs_stocks_api_url=os.getenv("BCS_STOCKS_API_URL", "").strip(),
             bcs_stocks_cache_file=os.getenv("BCS_STOCKS_CACHE_FILE", "bcs_stocks_cache.json"),
             universe_refresh_cycles=int(os.getenv("UNIVERSE_REFRESH_CYCLES", "30")),
@@ -535,6 +546,14 @@ class Settings:
             analytics_log_holds=os.getenv("ANALYTICS_LOG_HOLDS", "true").lower() == "true",
             analytics_outcome_eval_enabled=os.getenv("ANALYTICS_OUTCOME_EVAL_ENABLED", "false").lower() == "true",
             position_mgmt_mode=os.getenv("POSITION_MGMT_MODE", "off").strip().lower(),
+            adaptive_mode=os.getenv("ADAPTIVE_MODE", "off").strip().lower(),
+            adaptive_state_file=os.getenv("ADAPTIVE_STATE_FILE", "adaptive_state.json").strip(),
+            adaptive_lookback_days=int(os.getenv("ADAPTIVE_LOOKBACK_DAYS", "14")),
+            adaptive_refresh_cycles=int(os.getenv("ADAPTIVE_REFRESH_CYCLES", "5")),
+            adaptive_min_observations=int(os.getenv("ADAPTIVE_MIN_OBSERVATIONS", "5")),
+            adaptive_negative_outcome_pct=float(os.getenv("ADAPTIVE_NEGATIVE_OUTCOME_PCT", "-0.25")),
+            adaptive_positive_outcome_pct=float(os.getenv("ADAPTIVE_POSITIVE_OUTCOME_PCT", "0.05")),
+            adaptive_max_threshold_delta_frac=float(os.getenv("ADAPTIVE_MAX_THRESHOLD_DELTA_FRAC", "0.15")),
         )
 
 
@@ -1010,6 +1029,9 @@ class PaperBroker:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.state_path = Path(settings.paper_state_file)
+        self.balance_state_path = Path(settings.paper_balance_state_file)
+        self.initial_balance_rub = settings.paper_initial_balance_rub
+        self.last_reset_at = datetime.now(timezone.utc).isoformat()
         self.cash_rub = settings.paper_initial_balance_rub
         self.positions: Dict[str, float] = {}
         self.avg_price: Dict[str, float] = {}
@@ -1018,18 +1040,27 @@ class PaperBroker:
         self._load()
 
     def _load(self) -> None:
+        if self.state_path.exists():
+            with self.state_path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            self.cash_rub = safe_float(payload.get("cash_rub"), self.settings.paper_initial_balance_rub)
+            self.positions = {k: safe_float(v) for k, v in payload.get("positions", {}).items()}
+            self.avg_price = {k: safe_float(v) for k, v in payload.get("avg_price", {}).items()}
+            self.realized_pnl_rub = safe_float(payload.get("realized_pnl_rub"))
+            self.trade_count = int(payload.get("trade_count", 0))
+        if self.balance_state_path.exists():
+            with self.balance_state_path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            self.initial_balance_rub = safe_float(
+                payload.get("initial_balance_rub"), self.settings.paper_initial_balance_rub
+            )
+            self.last_reset_at = str(payload.get("last_reset_at") or self.last_reset_at)
+        else:
+            self.sync_balance_snapshot({})
         if not self.state_path.exists():
-            self._save()
-            return
-        with self.state_path.open("r", encoding="utf-8") as file:
-            payload = json.load(file)
-        self.cash_rub = safe_float(payload.get("cash_rub"), self.settings.paper_initial_balance_rub)
-        self.positions = {k: safe_float(v) for k, v in payload.get("positions", {}).items()}
-        self.avg_price = {k: safe_float(v) for k, v in payload.get("avg_price", {}).items()}
-        self.realized_pnl_rub = safe_float(payload.get("realized_pnl_rub"))
-        self.trade_count = int(payload.get("trade_count", 0))
+            self._save_trading_state()
 
-    def _save(self) -> None:
+    def _save_trading_state(self) -> None:
         payload = {
             "cash_rub": round(self.cash_rub, 2),
             "positions": self.positions,
@@ -1039,6 +1070,42 @@ class PaperBroker:
         }
         with self.state_path.open("w", encoding="utf-8") as file:
             json.dump(payload, file, ensure_ascii=True, indent=2)
+
+    def _fallback_prices(self) -> Dict[str, float]:
+        prices = {symbol: self.avg_price.get(symbol, 0.0) for symbol in self.positions}
+        return {symbol: price for symbol, price in prices.items() if price > 0}
+
+    def get_balance_snapshot(self, latest_prices: Dict[str, float]) -> Dict[str, Any]:
+        merged_prices = dict(self._fallback_prices())
+        merged_prices.update({k: safe_float(v) for k, v in latest_prices.items()})
+        market_value = sum(qty * merged_prices.get(symbol, 0.0) for symbol, qty in self.positions.items())
+        equity = self.cash_rub + market_value
+        total_pnl = equity - self.initial_balance_rub
+        unrealized_pnl = total_pnl - self.realized_pnl_rub
+        return {
+            "initial_balance_rub": round(self.initial_balance_rub, 2),
+            "current_balance_rub": round(equity, 2),
+            "cash_rub": round(self.cash_rub, 2),
+            "market_value_rub": round(market_value, 2),
+            "equity_rub": round(equity, 2),
+            "realized_pnl_total_rub": round(self.realized_pnl_rub, 2),
+            "realized_pnl_rub": round(self.realized_pnl_rub, 2),
+            "unrealized_pnl_rub": round(unrealized_pnl, 2),
+            "total_pnl_rub": round(total_pnl, 2),
+            "trade_count": self.trade_count,
+            "positions_count": len(self.positions),
+            "last_reset_at": self.last_reset_at,
+        }
+
+    def sync_balance_snapshot(self, latest_prices: Dict[str, float]) -> Dict[str, Any]:
+        snapshot = self.get_balance_snapshot(latest_prices)
+        with self.balance_state_path.open("w", encoding="utf-8") as file:
+            json.dump(snapshot, file, ensure_ascii=True, indent=2)
+        return snapshot
+
+    def _save(self, latest_prices: Optional[Dict[str, float]] = None) -> None:
+        self._save_trading_state()
+        self.sync_balance_snapshot(latest_prices or {})
 
     def place_order(self, symbol: str, side: str, amount_rub: float, market_price: float) -> None:
         if market_price <= 0 or amount_rub <= 0:
@@ -1073,24 +1140,10 @@ class PaperBroker:
             self.cash_rub += proceeds
             self.trade_count += 1
             LOGGER.info("[PAPER] SELL %s qty=%.6f price=%.4f", symbol, qty, market_price)
-        self._save()
+        self._save({symbol: market_price})
 
     def performance(self, latest_prices: Dict[str, float]) -> Dict[str, Any]:
-        market_value = sum(qty * latest_prices.get(symbol, 0.0) for symbol, qty in self.positions.items())
-        equity = self.cash_rub + market_value
-        initial_equity = self.settings.paper_initial_balance_rub
-        total_pnl = equity - initial_equity
-        unrealized_pnl = total_pnl - self.realized_pnl_rub
-        return {
-            "cash_rub": round(self.cash_rub, 2),
-            "market_value_rub": round(market_value, 2),
-            "equity_rub": round(equity, 2),
-            "realized_pnl_rub": round(self.realized_pnl_rub, 2),
-            "unrealized_pnl_rub": round(unrealized_pnl, 2),
-            "total_pnl_rub": round(total_pnl, 2),
-            "trade_count": self.trade_count,
-            "positions_count": len(self.positions),
-        }
+        return self.sync_balance_snapshot(latest_prices)
 
     def get_open_positions(self, latest_prices: Dict[str, float]) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
@@ -1121,6 +1174,23 @@ class PaperBroker:
 
     def can_afford_buy(self, amount_rub: float) -> bool:
         return self.cash_rub >= amount_rub
+
+    def reset_balance(self, initial_balance_rub: Optional[float] = None) -> Dict[str, Any]:
+        amount = safe_float(initial_balance_rub, self.settings.paper_initial_balance_rub)
+        if amount <= 0:
+            amount = self.settings.paper_initial_balance_rub
+        self.initial_balance_rub = amount
+        self.last_reset_at = datetime.now(timezone.utc).isoformat()
+        self.cash_rub = amount
+        self.positions = {}
+        self.avg_price = {}
+        self.realized_pnl_rub = 0.0
+        self.trade_count = 0
+        self._save({})
+        return self.get_balance_snapshot({})
+
+    def set_balance(self, initial_balance_rub: float) -> Dict[str, Any]:
+        return self.reset_balance(initial_balance_rub)
 
 
 class TelegramNotifier:
@@ -1168,6 +1238,7 @@ class TelegramCommandServer:
     BTN_STATUS = "📊 Статус"
     BTN_STRATEGY = "🧠 Стратегия"
     BTN_PNL = "📈 P&L"
+    BTN_BALANCE = "💰 Баланс"
     BTN_POSITIONS = "🧾 Позиции"
     BTN_HELP = "❓ Помощь"
 
@@ -1177,14 +1248,21 @@ class TelegramCommandServer:
         status_provider: Callable[[], str],
         strategy_provider: Callable[[], str],
         pnl_provider: Callable[[], str],
+        balance_provider: Callable[[], str],
         positions_provider: Callable[[], str],
+        balance_reset_handler: Callable[[Optional[float]], str],
+        balance_set_handler: Callable[[float], str],
     ):
         self.token = settings.telegram_bot_token
         self.chat_id = settings.telegram_chat_id
         self.status_provider = status_provider
         self.strategy_provider = strategy_provider
         self.pnl_provider = pnl_provider
+        self.balance_provider = balance_provider
         self.positions_provider = positions_provider
+        self.balance_reset_handler = balance_reset_handler
+        self.balance_set_handler = balance_set_handler
+        self.default_balance_amount = settings.paper_initial_balance_rub
         self._thread: Optional[Thread] = None
 
     def enabled(self) -> bool:
@@ -1198,7 +1276,8 @@ class TelegramCommandServer:
         actions_keyboard = ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text=self.BTN_STATUS), KeyboardButton(text=self.BTN_STRATEGY)],
-                [KeyboardButton(text=self.BTN_PNL), KeyboardButton(text=self.BTN_POSITIONS)],
+                [KeyboardButton(text=self.BTN_PNL), KeyboardButton(text=self.BTN_BALANCE)],
+                [KeyboardButton(text=self.BTN_POSITIONS)],
                 [KeyboardButton(text=self.BTN_HELP)],
             ],
             resize_keyboard=True,
@@ -1228,6 +1307,24 @@ class TelegramCommandServer:
         async def command_pnl(message: Message) -> None:
             await message.answer(self.pnl_provider())
 
+        @router.message(Command("balance"))
+        async def command_balance(message: Message) -> None:
+            await message.answer(self.balance_provider())
+
+        @router.message(Command("balance_reset"))
+        async def command_balance_reset(message: Message) -> None:
+            parts = (message.text or "").split()
+            amount = safe_float(parts[1], self._default_balance_amount()) if len(parts) > 1 else None
+            await message.answer(self.balance_reset_handler(amount))
+
+        @router.message(Command("balance_set"))
+        async def command_balance_set(message: Message) -> None:
+            parts = (message.text or "").split()
+            if len(parts) < 2:
+                await message.answer("💰 Укажите сумму: /balance_set 65000")
+                return
+            await message.answer(self.balance_set_handler(safe_float(parts[1], self._default_balance_amount())))
+
         @router.message(Command("positions"))
         async def command_positions(message: Message) -> None:
             await message.answer(self.positions_provider())
@@ -1235,7 +1332,10 @@ class TelegramCommandServer:
         @router.message(Command("help"))
         async def command_help(message: Message) -> None:
             await message.answer(
-                "❓ Подсказка:\nИспользуйте кнопки на клавиатуре ниже.",
+                "❓ Подсказка:\n"
+                "/status, /strategy, /pnl, /balance, /positions\n"
+                "/balance_reset [amount], /balance_set <amount>\n"
+                "Используйте кнопки на клавиатуре ниже.",
                 reply_markup=actions_keyboard,
             )
 
@@ -1251,6 +1351,10 @@ class TelegramCommandServer:
         async def button_pnl(message: Message) -> None:
             await message.answer(self.pnl_provider())
 
+        @router.message(F.text == self.BTN_BALANCE)
+        async def button_balance(message: Message) -> None:
+            await message.answer(self.balance_provider())
+
         @router.message(F.text == self.BTN_POSITIONS)
         async def button_positions(message: Message) -> None:
             await message.answer(self.positions_provider())
@@ -1258,7 +1362,10 @@ class TelegramCommandServer:
         @router.message(F.text == self.BTN_HELP)
         async def button_help(message: Message) -> None:
             await message.answer(
-                "❓ Подсказка:\nИспользуйте кнопки на клавиатуре ниже.",
+                "❓ Подсказка:\n"
+                "/status, /strategy, /pnl, /balance, /positions\n"
+                "/balance_reset [amount], /balance_set <amount>\n"
+                "Используйте кнопки на клавиатуре ниже.",
                 reply_markup=actions_keyboard,
             )
 
@@ -1295,6 +1402,9 @@ class TelegramCommandServer:
         self._thread = Thread(target=self._run, name="telegram-polling", daemon=True)
         self._thread.start()
         LOGGER.info("Telegram command server thread started.")
+
+    def _default_balance_amount(self) -> float:
+        return safe_float(self.default_balance_amount, 50000.0)
 
 
 class SignalEngine:
@@ -1349,6 +1459,7 @@ class SignalEngine:
         self.analytics_logger: Optional[SignalLogger] = None
         self.outcome_evaluator: Optional[OutcomeEvaluator] = None
         self.paper_mapper: Optional[PaperTradeMapper] = None
+        self.adaptive_engine: Optional[AdaptiveAnalysisEngine] = None
         if self.settings.analytics_enabled:
             try:
                 analytics_db_path = Path(self.settings.analytics_db_path)
@@ -1365,6 +1476,29 @@ class SignalEngine:
                 self.analytics_logger = None
                 self.outcome_evaluator = None
                 self.paper_mapper = None
+                self.adaptive_engine = None
+        if self.analytics_db and self.analytics_logger:
+            try:
+                adaptive_state_path = Path(self.settings.adaptive_state_file)
+                if not adaptive_state_path.is_absolute():
+                    adaptive_state_path = self.project_root / adaptive_state_path
+                self.adaptive_engine = AdaptiveAnalysisEngine(
+                    self.analytics_db,
+                    self.analytics_logger,
+                    state_path=adaptive_state_path,
+                    mode=self.settings.adaptive_mode,
+                    base_ml_threshold=self.settings.ml_prob_threshold,
+                    lookback_days=self.settings.adaptive_lookback_days,
+                    refresh_cycles=self.settings.adaptive_refresh_cycles,
+                    min_observations=self.settings.adaptive_min_observations,
+                    negative_outcome_pct=self.settings.adaptive_negative_outcome_pct,
+                    positive_outcome_pct=self.settings.adaptive_positive_outcome_pct,
+                    max_threshold_delta_frac=self.settings.adaptive_max_threshold_delta_frac,
+                )
+                LOGGER.info("Adaptive layer enabled: %s", adaptive_state_path)
+            except Exception as exc:  # pylint: disable=broad-except
+                LOGGER.warning("Failed to initialize adaptive layer: %s", exc)
+                self.adaptive_engine = None
         self.refresh_universe()
 
     def refresh_universe(self) -> None:
@@ -1562,6 +1696,7 @@ class SignalEngine:
 
         qty, _ = self.broker.get_position(symbol)
         has_position = qty > 0
+        market_regime = "trend_up" if st_dir >= 1 else "trend_down"
 
         if has_position:
             if st_dir <= -1:
@@ -1574,6 +1709,7 @@ class SignalEngine:
                         "ml_threshold": self.settings.ml_prob_threshold,
                     },
                     "market_regime": "trend_down",
+                    "adaptive_decision": None,
                 }
                 return ("SELL", -0.8, self._snapshot_from_features(close, ema50, rsi, macd, macd_signal, symbol))
             self._last_decision_meta[symbol] = {
@@ -1584,12 +1720,26 @@ class SignalEngine:
                     "ml_prob_up": ml_proba,
                     "ml_threshold": self.settings.ml_prob_threshold,
                 },
-                "market_regime": "trend_up" if st_dir >= 1 else "trend_down",
+                "market_regime": market_regime,
+                "adaptive_decision": None,
             }
             return ("HOLD", 0.0, self._snapshot_from_features(close, ema50, rsi, macd, macd_signal, symbol))
 
         trend_ok = st_dir >= 1 and close > ema200
-        ml_ok = ml_proba is None or ml_proba >= self.settings.ml_prob_threshold
+        base_ml_ok = ml_proba is None or ml_proba >= self.settings.ml_prob_threshold
+        adaptive_decision: Optional[AdaptiveDecision] = None
+        effective_ml_threshold = self.settings.ml_prob_threshold
+        if trend_ok and self.adaptive_engine and ml_proba is not None:
+            adaptive_decision = self.adaptive_engine.evaluate_entry(
+                symbol=symbol,
+                feature_snapshot=feature_snapshot,
+                market_regime=market_regime,
+                ml_prob_up=ml_proba,
+                trading_mode=self.settings.trading_mode,
+            )
+            if adaptive_decision is not None and adaptive_decision.should_apply:
+                effective_ml_threshold = adaptive_decision.effective_threshold
+        ml_ok = ml_proba is None or ml_proba >= effective_ml_threshold
         decision_label = "ALLOW_BUY" if trend_ok and ml_ok else "BLOCK_BUY"
         reason_code = "ENTRY_OK" if trend_ok and ml_ok else "BLOCK_ML" if trend_ok and not ml_ok else "BLOCK_TREND"
         reason_text = (
@@ -1599,6 +1749,15 @@ class SignalEngine:
             if trend_ok and not ml_ok
             else "Trend filter rejected entry."
         )
+        if adaptive_decision is not None and adaptive_decision.changed_decision and adaptive_decision.should_apply:
+            if trend_ok and base_ml_ok and not ml_ok:
+                reason_code = "BLOCK_ADAPTIVE_REGIME"
+                reason_text = adaptive_decision.reason_text
+                decision_label = "BLOCK_BUY"
+            elif trend_ok and not base_ml_ok and ml_ok:
+                reason_code = "ENTRY_OK"
+                reason_text = "Trend and ML conditions passed. Adaptive regime filter applied."
+                decision_label = "ALLOW_BUY"
         trend_bypass = False
         if reason_code == "BLOCK_TREND" and symbol.upper() in ():
             if ml_ok:
@@ -1617,15 +1776,19 @@ class SignalEngine:
             "model_version": self.ml_model_version,
             "ml_prob_up": ml_proba,
             "ml_threshold": self.settings.ml_prob_threshold,
+            "ml_threshold_effective": effective_ml_threshold,
             "trend_ok": bool(trend_ok),
             "ml_ok": bool(ml_ok),
+            "adaptive_mode": self.settings.adaptive_mode,
+            "adaptive_decision": asdict(adaptive_decision) if adaptive_decision is not None else None,
         }
         self._last_decision_meta[symbol] = {
             "reason_code": reason_code,
             "reason_text": reason_text,
             "feature_snapshot": feature_snapshot,
             "model_snapshot": model_snapshot,
-            "market_regime": "trend_up" if st_dir >= 1 else "trend_down",
+            "market_regime": market_regime,
+            "adaptive_decision": asdict(adaptive_decision) if adaptive_decision is not None else None,
         }
         if self.ml_model is not None:
             allow_buy_ml = (trend_ok and ml_ok) or (trend_bypass and ml_ok)
@@ -1652,7 +1815,7 @@ class SignalEngine:
             float(ema200),
             trend_ok,
             "n/a" if ml_proba is None else f"{ml_proba:.4f}",
-            self.settings.ml_prob_threshold,
+            effective_ml_threshold,
             ml_ok,
         )
         return ("HOLD", 0.0, self._snapshot_from_features(close, ema50, rsi, macd, macd_signal, symbol))
@@ -1690,9 +1853,15 @@ class SignalEngine:
         )
 
     def _format_entry_message(
-        self, symbol: str, score: float, snapshot: IndicatorSnapshot, sl_price: float, tp_price: float
+        self,
+        symbol: str,
+        score: float,
+        snapshot: IndicatorSnapshot,
+        sl_price: float,
+        tp_price: float,
+        adaptive_note: Optional[str] = None,
     ) -> str:
-        return (
+        text = (
             f"🟢 {symbol} | ВХОД LONG\n"
             f"💵 Цена входа: {snapshot.price:.4f}\n"
             f"📊 Скор: {score:.3f}\n"
@@ -1703,12 +1872,44 @@ class SignalEngine:
             f"🧭 RSI/ADX: {snapshot.rsi:.2f}/{snapshot.adx:.2f}\n"
             f"⚙️ Режим: {self.settings.trading_mode}"
         )
+        if adaptive_note:
+            text += f"\n🧩 {adaptive_note}"
+        return text
+
+    def _adaptive_note_from_meta(self, adaptive_meta: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not adaptive_meta:
+            return None
+        if adaptive_meta.get("mode") == "paper" and adaptive_meta.get("changed_decision"):
+            return "Adaptive regime filter applied"
+        if adaptive_meta.get("mode") == "shadow" and adaptive_meta.get("changed_decision"):
+            return "Adaptive shadow recommendation logged"
+        return None
+
+    def _balance_lines_for_message(self, latest_prices: Dict[str, float]) -> str:
+        if not isinstance(self.broker, PaperBroker):
+            return ""
+        snapshot = self.broker.get_balance_snapshot(latest_prices)
+        total = safe_float(snapshot.get("total_pnl_rub", 0.0))
+        return (
+            f"\n💰 Баланс: {format_rub(snapshot.get('current_balance_rub', 0))}"
+            f"\n📈 С последнего reset: {format_rub(total)}"
+        )
 
     def _close_trade(self, symbol: str, exit_price: float, reason: str, qty: float, avg_price: float) -> None:
         self._pm_states.pop(symbol, None)
         pnl = (exit_price - avg_price) * qty
         pnl_pct = ((exit_price / avg_price) - 1.0) * 100 if avg_price > 0 else 0.0
         pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+        meta = self.trade_meta.pop(symbol, None)
+        signal_id = meta.get("signal_id") if meta else None
+        local_trade_id = meta.get("local_trade_id") if meta else None
+        adaptive_note = meta.get("adaptive_note") if meta else None
+        balance_lines = self._balance_lines_for_message({**self.last_prices, symbol: exit_price})
+        balance_after_rub = None
+        if isinstance(self.broker, PaperBroker):
+            balance_after_rub = safe_float(
+                self.broker.get_balance_snapshot({**self.last_prices, symbol: exit_price}).get("current_balance_rub", 0.0)
+            )
         close_text = (
             f"🔔 {symbol} | СДЕЛКА ЗАКРЫТА\n"
             f"Причина: {reason}\n"
@@ -1717,10 +1918,10 @@ class SignalEngine:
             f"📦 Объем: {qty:.6f}\n"
             f"{pnl_emoji} Результат: {format_close_pnl_line(pnl, pnl_pct)}"
         )
+        if adaptive_note:
+            close_text += f"\n🧩 {adaptive_note}"
+        close_text += balance_lines
         self.notifier.send(close_text)
-        meta = self.trade_meta.pop(symbol, None)
-        signal_id = meta.get("signal_id") if meta else None
-        local_trade_id = meta.get("local_trade_id") if meta else None
         if self.analytics_logger:
             try:
                 self.analytics_logger.update_signal_status(signal_id, "CLOSED")
@@ -1738,6 +1939,7 @@ class SignalEngine:
                         "exit_price": exit_price,
                         "pnl": pnl,
                         "pnl_pct": pnl_pct,
+                        "balance_after_rub": balance_after_rub,
                     },
                     decision_ts=self._iso_now(),
                 )
@@ -1766,6 +1968,9 @@ class SignalEngine:
                 f"📌 Причина: {reason}\n"
                 f"{pnl_emoji} Результат: {format_close_pnl_line(pnl, pnl_pct)}"
             )
+            if adaptive_note:
+                closed_entry_text += f"\n🧩 {adaptive_note}"
+            closed_entry_text += balance_lines
             self.notifier.edit(meta.get("entry_message_id"), closed_entry_text)
 
     @staticmethod
@@ -1839,12 +2044,14 @@ class SignalEngine:
         pnl = (exit_price - avg_price) * qty_exit
         pnl_pct = ((exit_price / avg_price) - 1.0) * 100 if avg_price > 0 else 0.0
         pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+        balance_lines = self._balance_lines_for_message({**self.last_prices, symbol: exit_price})
         msg = (
             f"📊 {symbol} | ЧАСТИЧНЫЙ ВЫХОД ({reason_code})\n"
             f"💵 Средняя: {avg_price:.4f}  Выход: {exit_price:.4f}\n"
             f"📦 Объём: {qty_exit:.6f}\n"
             f"{pnl_emoji} {format_close_pnl_line(pnl, pnl_pct)}"
         )
+        msg += balance_lines
         self.notifier.send(msg)
         meta = self.trade_meta.get(symbol, {})
         signal_id = meta.get("signal_id")
@@ -2028,6 +2235,11 @@ class SignalEngine:
             f"🕒 Таймфрейм: {self.settings.interval}\n"
             f"🌍 Рынок: screener={self.settings.screener}, exchange={self.settings.exchange}\n"
         )
+        adaptive_line = (
+            f"🧩 Adaptive: {self.adaptive_engine.describe_policy()}\n"
+            if self.adaptive_engine is not None
+            else "🧩 Adaptive: off\n"
+        )
         if self.settings.strategy_mode == "supertrend_ml":
             ml_status = "✅ загружена" if self.ml_model and getattr(self.ml_model, "_is_fitted", False) else "❌ не обучена"
             return (
@@ -2036,6 +2248,7 @@ class SignalEngine:
                 + f"🤖 ML-модель: {ml_status}\n"
                 + f"🛑 Stop-loss: {self.strategy.stop_loss_pct * 100:.2f}%\n"
                 + f"🎯 Take-profit: {self.strategy.take_profit_pct * 100:.2f}%\n"
+                + adaptive_line
             )
         return (
             base
@@ -2049,7 +2262,8 @@ class SignalEngine:
             + f"🛑 Stop-loss: {self.strategy.stop_loss_pct * 100:.2f}%\n"
             + f"🎯 Take-profit: {self.strategy.take_profit_pct * 100:.2f}%\n"
             + f"🤖 AI-перенастройка: каждые {self.settings.openai_rebalance_cycles} циклов\n"
-            + f"🛡️ AI-фильтр риска: {self.settings.enable_ai_risk_filter}"
+            + f"🛡️ AI-фильтр риска: {self.settings.enable_ai_risk_filter}\n"
+            + adaptive_line.rstrip()
         )
 
     def get_pnl_text(self) -> str:
@@ -2067,6 +2281,54 @@ class SignalEngine:
             f"📌 Нереализованный P&L: {format_rub(unrealized)}\n"
             f"💼 Капитал: {format_rub(p.get('equity_rub', 0))}\n"
             f"💵 Кэш: {format_rub(p.get('cash_rub', 0))}"
+        )
+
+    def get_balance_text(self) -> str:
+        if not isinstance(self.broker, PaperBroker):
+            return "💰 Баланс доступен только в paper-режиме."
+        snapshot = self.broker.get_balance_snapshot(self.last_prices)
+        total = safe_float(snapshot.get("total_pnl_rub", 0.0))
+        total_emoji = "🟢" if total >= 0 else "🔴"
+        return (
+            "💰 Виртуальный баланс\n"
+            f"🏁 Старт: {format_rub(snapshot.get('initial_balance_rub', 0))}\n"
+            f"💼 Баланс: {format_rub(snapshot.get('current_balance_rub', 0))}\n"
+            f"✅ Реализовано: {format_rub(snapshot.get('realized_pnl_total_rub', 0))}\n"
+            f"📌 Нереализовано: {format_rub(snapshot.get('unrealized_pnl_rub', 0))}\n"
+            f"{total_emoji} С последнего reset: {format_rub(total)}\n"
+            f"🕒 Reset: {snapshot.get('last_reset_at', 'n/a')}"
+        )
+
+    def reset_balance(self, initial_balance_rub: Optional[float] = None) -> str:
+        if not isinstance(self.broker, PaperBroker):
+            return "💰 Сброс баланса доступен только в paper-режиме."
+        snapshot = self.broker.reset_balance(initial_balance_rub)
+        self.trade_meta = {}
+        self._pm_states = {}
+        self._pm_profiles = {}
+        self._last_buy_bar_key = {}
+        self._last_close_bar_key = {}
+        self.last_performance = snapshot
+        return (
+            "💰 Баланс сброшен.\n"
+            f"🏁 Новый старт: {format_rub(snapshot.get('initial_balance_rub', 0))}\n"
+            f"🕒 Reset: {snapshot.get('last_reset_at', 'n/a')}"
+        )
+
+    def set_balance(self, initial_balance_rub: float) -> str:
+        if not isinstance(self.broker, PaperBroker):
+            return "💰 Установка баланса доступна только в paper-режиме."
+        snapshot = self.broker.set_balance(initial_balance_rub)
+        self.trade_meta = {}
+        self._pm_states = {}
+        self._pm_profiles = {}
+        self._last_buy_bar_key = {}
+        self._last_close_bar_key = {}
+        self.last_performance = snapshot
+        return (
+            "💰 Стартовый баланс обновлён.\n"
+            f"🏁 Новый старт: {format_rub(snapshot.get('initial_balance_rub', 0))}\n"
+            f"🕒 Reset: {snapshot.get('last_reset_at', 'n/a')}"
         )
 
     def get_open_positions_text(self) -> str:
@@ -2128,6 +2390,11 @@ class SignalEngine:
 
         if self.cycle == 1 or self.cycle % self.settings.universe_refresh_cycles == 0:
             self.refresh_universe()
+        if self.adaptive_engine is not None:
+            try:
+                self.adaptive_engine.refresh(self.cycle)
+            except Exception as exc:  # pylint: disable=broad-except
+                LOGGER.warning("Adaptive refresh failed: %s", exc)
 
         latest_prices: Dict[str, float] = {}
         market_sample: List[Dict[str, Any]] = []
@@ -2314,6 +2581,7 @@ class SignalEngine:
                         continue
 
                 signal_id: Optional[str] = None
+                adaptive_meta = decision_meta.get("adaptive_decision") if decision_meta else None
                 if self.analytics_logger and (action in ("BUY", "SELL") or self.settings.analytics_log_holds):
                     stop_price = None
                     target_price = None
@@ -2348,9 +2616,25 @@ class SignalEngine:
                         decision_label=action,
                         reason_code=reason_code,
                         reason_text=reason_text,
-                        details={"score": score, "price": snapshot.price, "strategy_mode": self.settings.strategy_mode},
+                        details={
+                            "score": score,
+                            "price": snapshot.price,
+                            "strategy_mode": self.settings.strategy_mode,
+                            "adaptive_mode": self.settings.adaptive_mode,
+                            "adaptive_decision": adaptive_meta,
+                        },
                         decision_ts=self._iso_now(),
                     )
+                    if self.adaptive_engine is not None and adaptive_meta is not None:
+                        try:
+                            self.adaptive_engine.log_signal_adaptation(
+                                signal_id=signal_id,
+                                run_id=self.current_run_id,
+                                ticker=symbol,
+                                decision=AdaptiveDecision(**adaptive_meta),
+                            )
+                        except Exception as exc:  # pylint: disable=broad-except
+                            LOGGER.warning("Adaptive signal log failed for %s: %s", symbol, exc)
 
                 LOGGER.info("Symbol=%s price=%.4f score=%.3f action=%s", symbol, snapshot.price, score, action)
 
@@ -2370,7 +2654,10 @@ class SignalEngine:
                             self._last_buy_bar_key[symbol] = bar_key_buy
                         sl_price = after_avg * (1.0 - self.strategy.stop_loss_pct)
                         tp_price = after_avg * (1.0 + self.strategy.take_profit_pct)
-                        entry_message = self._format_entry_message(symbol, score, snapshot, sl_price, tp_price)
+                        adaptive_note = self._adaptive_note_from_meta(adaptive_meta)
+                        entry_message = self._format_entry_message(
+                            symbol, score, snapshot, sl_price, tp_price, adaptive_note=adaptive_note
+                        )
                         entry_message_id = self.notifier.send(entry_message)
                         self.trade_meta[symbol] = {
                             "entry_price": after_avg,
@@ -2380,6 +2667,7 @@ class SignalEngine:
                             "signal_id": signal_id,
                             "local_trade_id": local_trade_id,
                             "entry_bar_key": bar_key_buy,
+                            "adaptive_note": adaptive_note,
                         }
                         if self.analytics_logger:
                             self.analytics_logger.log_decision(
@@ -2511,16 +2799,40 @@ def main() -> None:
             return "⏳ Бот инициализируется, подождите..."
         return current.get_open_positions_text()
 
+    def balance_provider() -> str:
+        current = engine_ref["engine"]
+        if current is None:
+            return "⏳ Бот инициализируется, подождите..."
+        return current.get_balance_text()
+
+    def balance_reset_handler(amount: Optional[float]) -> str:
+        current = engine_ref["engine"]
+        if current is None:
+            return "⏳ Бот инициализируется, подождите..."
+        return current.reset_balance(amount)
+
+    def balance_set_handler(amount: float) -> str:
+        current = engine_ref["engine"]
+        if current is None:
+            return "⏳ Бот инициализируется, подождите..."
+        return current.set_balance(amount)
+
     command_server = TelegramCommandServer(
         settings,
         status_provider,
         strategy_provider,
         pnl_provider,
+        balance_provider,
         positions_provider,
+        balance_reset_handler,
+        balance_set_handler,
     )
     if command_server.enabled():
         command_server.start()
-        LOGGER.info("Telegram commands enabled (/start, /status, /strategy, /pnl, /positions, /help).")
+        LOGGER.info(
+            "Telegram commands enabled (/start, /status, /strategy, /pnl, /balance, "
+            "/balance_reset, /balance_set, /positions, /help)."
+        )
 
     engine = SignalEngine(settings)
     engine_ref["engine"] = engine

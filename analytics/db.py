@@ -169,12 +169,32 @@ CREATE TABLE IF NOT EXISTS paper_trade_links (
   FOREIGN KEY (signal_id) REFERENCES signals(signal_id)
 );
 
+CREATE TABLE IF NOT EXISTS adaptive_actions (
+  action_id TEXT PRIMARY KEY,
+  action_ts TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  bucket_key TEXT,
+  parameter_name TEXT NOT NULL,
+  old_value REAL,
+  new_value REAL,
+  confidence_score REAL,
+  sample_size INTEGER,
+  action_status TEXT NOT NULL,
+  reason_text TEXT,
+  metrics_json TEXT,
+  window_summary_json TEXT,
+  created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(signal_ts);
 CREATE INDEX IF NOT EXISTS idx_signals_ticker ON signals(ticker);
 CREATE INDEX IF NOT EXISTS idx_signals_run ON signals(run_id);
 CREATE INDEX IF NOT EXISTS idx_outcomes_signal ON signal_outcomes(signal_id);
 CREATE INDEX IF NOT EXISTS idx_decisions_ticker_ts ON decision_logs(ticker, decision_ts);
 CREATE INDEX IF NOT EXISTS idx_inference_run ON model_inference_logs(run_id);
+CREATE INDEX IF NOT EXISTS idx_adaptive_actions_ts ON adaptive_actions(action_ts);
+CREATE INDEX IF NOT EXISTS idx_adaptive_actions_scope ON adaptive_actions(scope, bucket_key);
 """
 
 
