@@ -1918,7 +1918,30 @@ class SignalEngine:
             )
             if adaptive_decision is not None and adaptive_decision.should_apply:
                 effective_ml_threshold = adaptive_decision.effective_threshold
+        # DB-first volume_ratio adaptive (пакет adaptive/): только paper, флаг ADAPTIVE_USE_DB_VOLUME_LOOP
+        volume_ratio_adaptive_details: Optional[Dict[str, Any]] = None
+        db_volume_reason_code: Optional[str] = None
+        if (
+            os.getenv("ADAPTIVE_USE_DB_VOLUME_LOOP", "").strip().lower() in ("1", "true", "yes", "on")
+            and self.settings.trading_mode == "paper"
+        ):
+            from adaptive.bot_hook import prepare_ml_buy_decision
+
+            d = prepare_ml_buy_decision(
+                ml_prob=ml_proba,
+                feature_snapshot=feature_snapshot,
+                trading_mode=self.settings.trading_mode,
+                adaptive_mode=self.settings.adaptive_mode,
+                base_ml_threshold=float(effective_ml_threshold),
+            )
+            volume_ratio_adaptive_details = d.get("details_adaptive")
+            if not d["allow_buy"]:
+                db_volume_reason_code = d.get("reason_code")
+            elif d.get("effective_ml_threshold") is not None:
+                effective_ml_threshold = float(d["effective_ml_threshold"])
         ml_ok = ml_proba is None or ml_proba >= effective_ml_threshold
+        if db_volume_reason_code:
+            ml_ok = False
         decision_label = "ALLOW_BUY" if trend_ok and ml_ok else "BLOCK_BUY"
         reason_code = "ENTRY_OK" if trend_ok and ml_ok else "BLOCK_ML" if trend_ok and not ml_ok else "BLOCK_TREND"
         reason_text = (
@@ -1928,8 +1951,13 @@ class SignalEngine:
             if trend_ok and not ml_ok
             else "Trend filter rejected entry."
         )
+        if db_volume_reason_code and trend_ok and not ml_ok:
+            reason_code = db_volume_reason_code
+            ar = (volume_ratio_adaptive_details or {}).get("adaptive_reason") or ""
+            reason_text = f"DB volume-ratio adaptive: {ar}".strip()
+            decision_label = "BLOCK_BUY"
         if adaptive_decision is not None and adaptive_decision.changed_decision and adaptive_decision.should_apply:
-            if trend_ok and base_ml_ok and not ml_ok:
+            if trend_ok and base_ml_ok and not ml_ok and not db_volume_reason_code:
                 reason_code = "BLOCK_ADAPTIVE_REGIME"
                 reason_text = adaptive_decision.reason_text
                 decision_label = "BLOCK_BUY"
@@ -1960,6 +1988,7 @@ class SignalEngine:
             "ml_ok": bool(ml_ok),
             "adaptive_mode": self.settings.adaptive_mode,
             "adaptive_decision": asdict(adaptive_decision) if adaptive_decision is not None else None,
+            "volume_ratio_adaptive": volume_ratio_adaptive_details,
         }
         self._last_decision_meta[symbol] = {
             "reason_code": reason_code,

@@ -41,7 +41,9 @@ class AdaptiveEngine:
         base_ml = float(os.getenv("ML_PROB_THRESHOLD", "0.63"))
         state = self.store.load(base_ml)
         balance = load_paper_balance(self.cfg.balance_state_path)
-        buckets = fetch_bucket_close_stats(self.db, self.cfg.observation_days)
+        buckets = fetch_bucket_close_stats(
+            self.db, self.cfg.observation_days, self.cfg.min_sample_per_bucket
+        )
         report = build_self_review_report(self.cfg, buckets, balance)
 
         evaluated = self._evaluate_pending(state)
@@ -218,7 +220,7 @@ class AdaptiveEngine:
                 f"{self.cfg.observation_days}d (pre-change diagnostic window)"
             ),
             "pre_avg_net_pnl_pct": st.avg_net_pnl_pct,
-            "pre_n_signals": st.n_signals,
+            "pre_n_signals": st.n_closed,
             "pre_sum_net_pnl": st.sum_net_pnl,
             "gross_pos_net_nonpos": st.gross_pos_net_nonpos,
             "near_zero_churn": st.near_zero_churn,
@@ -285,7 +287,7 @@ class AdaptiveEngine:
                 parameter_name=param,
                 old_value=insert_old,
                 new_value=insert_new,
-                sample_size=st.n_signals,
+                sample_size=st.n_closed,
                 confidence_score=rec.confidence,
                 action_status="shadow_recommendation",
                 reason_text=rec.reason,
@@ -308,7 +310,7 @@ class AdaptiveEngine:
             parameter_name=param,
             old_value=insert_old,
             new_value=insert_new,
-            sample_size=st.n_signals,
+                sample_size=st.n_closed,
             confidence_score=rec.confidence,
             action_status="applied",
             reason_text=rec.reason,

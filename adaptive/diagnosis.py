@@ -25,7 +25,7 @@ def diagnose_bucket(
     currently_blocked: bool,
 ) -> BucketRecommendation:
     label = BUCKET_LABELS[stats.bucket]
-    n = stats.n_signals
+    n = stats.n_closed
     if n < cfg.min_sample_per_bucket:
         return BucketRecommendation(
             bucket=stats.bucket,
