@@ -19,6 +19,7 @@ __pycache__/
 paper_state.json
 paper_balance_state.json
 adaptive_state.json
+adaptive_runtime_state.json
 strategy_state.json
 bcs_stocks_cache.json
 train_ml_screen.log

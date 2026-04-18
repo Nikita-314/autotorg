@@ -175,7 +175,10 @@ class OutcomeEvaluator:
             WHERE s.entry_price IS NOT NULL
               AND (
                 s.side IN ('BUY','SELL')
-                OR (s.side IN ('HOLD','BLOCK') AND s.reason_code IN ('BLOCK_ML','BLOCK_TREND'))
+                OR (s.side IN ('HOLD','BLOCK') AND s.reason_code IN (
+                    'BLOCK_ML','BLOCK_TREND','BLOCK_HIGH_VOLUME_RATIO',
+                    'BLOCK_ADAPTIVE','BLOCK_ADAPTIVE_BUCKET'
+                ))
               )
               AND (
                 o.signal_id IS NULL
