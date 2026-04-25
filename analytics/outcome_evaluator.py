@@ -198,17 +198,18 @@ class OutcomeEvaluator:
         )
         updated = 0
         for row in rows:
+            row_dict = dict(row)
             try:
-                outcome = self.evaluate_signal(row, load_candles_fn)
+                outcome = self.evaluate_signal(row_dict, load_candles_fn)
                 if outcome is None:
                     continue
-                self.logger.upsert_signal_outcome(str(row["signal_id"]), outcome)
+                self.logger.upsert_signal_outcome(str(row_dict["signal_id"]), outcome)
                 updated += 1
             except Exception as exc:  # pylint: disable=broad-except
                 LOGGER.warning(
                     "Outcome evaluate failed signal_id=%s ticker=%s err=%s",
-                    row.get("signal_id"),
-                    row.get("ticker"),
+                    row_dict.get("signal_id"),
+                    row_dict.get("ticker"),
                     exc,
                 )
         return updated

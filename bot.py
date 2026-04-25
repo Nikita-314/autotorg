@@ -1408,7 +1408,18 @@ class TelegramCommandServer:
         bot = Bot(token=self.token)
         dispatcher = Dispatcher()
         router = Router()
-        LOGGER.info("Telegram polling started.")
+        try:
+            me = await bot.get_me()
+            LOGGER.info("Telegram: бот @%s, polling запускается", me.username or me.id)
+        except Exception as exc:  # pylint: disable=broad-except
+            LOGGER.exception("Telegram: токен недействителен или сеть недоступна (%s). Проверьте TELEGRAM_BOT_TOKEN.", exc)
+            await bot.session.close()
+            return
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+        except Exception as exc:  # pylint: disable=broad-except
+            LOGGER.warning("Telegram: delete_webhook пропущен (%s)", exc)
+        LOGGER.info("Telegram long polling started.")
         actions_keyboard = ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text=self.BTN_STATUS), KeyboardButton(text=self.BTN_STRATEGY)],
@@ -1570,7 +1581,7 @@ class TelegramCommandServer:
         try:
             asyncio.run(self._run_polling())
         except Exception as exc:  # pylint: disable=broad-except
-            LOGGER.warning("Telegram polling stopped: %s", exc)
+            LOGGER.exception("Telegram polling остановлен с ошибкой: %s", exc)
 
     def start(self) -> None:
         if not self.enabled():
@@ -1618,7 +1629,13 @@ class SignalEngine:
         self.symbols: List[str] = []
         self.cycle = 0
         self.last_prices: Dict[str, float] = {}
+        # До первого завершённого run_once get_status/get_pnl брали last_performance без equity/cash → нули.
         self.last_performance: Dict[str, Any] = {"status": "starting"}
+        if isinstance(self.broker, PaperBroker):
+            self.last_performance = {
+                **self.broker.get_balance_snapshot({}),
+                "status": "starting",
+            }
         self.last_ai_blocked_signature: Tuple[str, ...] = tuple()
         self.trade_meta: Dict[str, Dict[str, Any]] = {}
         self.current_run_id: Optional[str] = None
@@ -1929,7 +1946,7 @@ class SignalEngine:
 
             d = prepare_ml_buy_decision(
                 ml_prob=ml_proba,
-                feature_snapshot=feature_snapshot,
+                feature_snapshot={**feature_snapshot, "ticker": symbol},
                 trading_mode=self.settings.trading_mode,
                 adaptive_mode=self.settings.adaptive_mode,
                 base_ml_threshold=float(effective_ml_threshold),
@@ -3237,6 +3254,11 @@ def main() -> None:
             "Telegram commands enabled (/start, /status, /strategy, /pnl, /balance, "
             "/balance_reset, /balance_set, /positions, /close_all_positions, /help)."
         )
+    else:
+        LOGGER.warning(
+            "Telegram command polling disabled: TELEGRAM_BOT_TOKEN is empty. "
+            "Проверьте .env в каталоге запуска (screen должен делать cd в корень проекта) и перезапустите бота."
+        )
 
     engine = SignalEngine(settings)
     engine_ref["engine"] = engine
@@ -3253,6 +3275,11 @@ def main() -> None:
             f"🕒 Таймфрейм: {settings.interval}\n"
             f"🧺 Вселенная: {len(engine.symbols)} тикеров\n"
             "⌨️ Для управления используйте кнопки клавиатуры в чате."
+        )
+    elif settings.telegram_bot_token.strip():
+        LOGGER.info(
+            "Стартовое сообщение в чат не отправлено: пустой TELEGRAM_CHAT_ID "
+            "(уведомления отключены; команды боту в Telegram при этом работают, если polling запущен)."
         )
 
     while True:

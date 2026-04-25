@@ -2,7 +2,7 @@ python-dotenv
 requests
 tradingview-ta
 pydantic
-aiogram
+aiogram>=3.0,<4
 openai
 yfinance
 pandas
