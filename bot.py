@@ -1946,7 +1946,7 @@ class SignalEngine:
 
             d = prepare_ml_buy_decision(
                 ml_prob=ml_proba,
-                feature_snapshot={**feature_snapshot, "ticker": symbol},
+                feature_snapshot=feature_snapshot,
                 trading_mode=self.settings.trading_mode,
                 adaptive_mode=self.settings.adaptive_mode,
                 base_ml_threshold=float(effective_ml_threshold),
