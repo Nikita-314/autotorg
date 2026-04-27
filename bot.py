@@ -2729,20 +2729,57 @@ class SignalEngine:
                 if isinstance(self.broker, PaperBroker)
                 else {"current_balance_rub": 0.0}
             )
-            summary = (
-                "🛑 Закрытие всех позиций завершено\n"
-                f"Всего к закрытию: {len(symbols)}\n"
-                f"Успешно закрыто: {closed}\n"
-                f"Ошибка: {len(errors)}\n"
-                f"Gross: {format_signed_rub(gross_total)}\n"
-                f"Комиссия: {format_signed_rub(-abs(commission_total))}\n"
-                f"Net: {format_signed_rub(net_total)}\n"
-                f"Баланс: {format_rub(balance_snapshot.get('current_balance_rub', 0))}"
-            )
+            balance_before_reset = safe_float(balance_snapshot.get("current_balance_rub", 0.0))
+            remaining_open = [sym for sym, qty in self.broker.positions.items() if safe_float(qty) > 0]
+            all_closed_ok = len(errors) == 0 and len(remaining_open) == 0
+            default_initial_rub = float(self.settings.paper_initial_balance_rub)
+            reset_applied = False
+            new_balance_after_reset: Optional[float] = None
+            if all_closed_ok and isinstance(self.broker, PaperBroker):
+                reset_snap = self.broker.reset_balance(None)
+                self.trade_meta = {}
+                self._pm_states = {}
+                self._pm_profiles = {}
+                self._last_buy_bar_key = {}
+                self._last_close_bar_key = {}
+                self.last_performance = reset_snap
+                reset_applied = True
+                new_balance_after_reset = safe_float(reset_snap.get("current_balance_rub", default_initial_rub))
+
+            lines: List[str] = [
+                "🛑 Закрытие всех позиций завершено",
+                f"• Закрыто позиций: {closed} (было к закрытию: {len(symbols)})",
+                f"• Суммарный gross: {format_signed_rub(gross_total)}",
+                f"• Комиссия (всего): {format_rub(commission_total)}",
+                f"• Net (сумма): {format_signed_rub(net_total)}",
+            ]
+            if reset_applied and new_balance_after_reset is not None:
+                lines.extend(
+                    [
+                        f"• Баланс до сброса: {format_rub(balance_before_reset)}",
+                        "✅ Paper-баланс сброшен на значение по умолчанию "
+                        f"(как /balance_reset без аргумента: {format_rub(default_initial_rub)}).",
+                        f"• Новый баланс после сброса: {format_rub(new_balance_after_reset)}",
+                    ]
+                )
+            else:
+                lines.append(
+                    f"• Текущий баланс (equity): {format_rub(balance_snapshot.get('current_balance_rub', 0))}"
+                )
+                if not all_closed_ok:
+                    lines.append(
+                        "⚠️ Сброс баланса не выполнён: остались незакрытые позиции или были ошибки закрытия."
+                    )
+            lines.append(f"• Ошибок закрытия: {len(errors)}")
+            summary = "\n".join(lines)
             if errors:
                 summary += "\n" + "\n".join([f"• {item}" for item in errors[:8]])
                 if len(errors) > 8:
                     summary += f"\n… и еще {len(errors) - 8}"
+            if remaining_open and not reset_applied:
+                summary += "\n• Не закрыто (позиции): " + ", ".join(remaining_open[:20])
+                if len(remaining_open) > 20:
+                    summary += f" … +{len(remaining_open) - 20}"
             return summary
 
     def _check_risk_exit(self, symbol: str, price: float, bar_key: str) -> bool:
