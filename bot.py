@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import requests
@@ -1385,6 +1385,7 @@ class TelegramCommandServer:
         balance_set_handler: Callable[[float], str],
         close_all_check_handler: Callable[[], Tuple[bool, str]],
         close_all_execute_handler: Callable[[], str],
+        set_close_all_entry_pause: Optional[Callable[[bool], None]] = None,
     ):
         self.token = settings.telegram_bot_token
         self.chat_id = settings.telegram_chat_id
@@ -1397,6 +1398,7 @@ class TelegramCommandServer:
         self.balance_set_handler = balance_set_handler
         self.close_all_check_handler = close_all_check_handler
         self.close_all_execute_handler = close_all_execute_handler
+        self.set_close_all_entry_pause = set_close_all_entry_pause
         self.default_balance_amount = settings.paper_initial_balance_rub
         self._thread: Optional[Thread] = None
         self._pending_close_all_chats: Set[int] = set()
@@ -1448,11 +1450,17 @@ class TelegramCommandServer:
             allowed, text = self.close_all_check_handler()
             if not allowed:
                 self._pending_close_all_chats.discard(message.chat.id)
+                if self.set_close_all_entry_pause:
+                    self.set_close_all_entry_pause(False)
                 await message.answer(text, reply_markup=actions_keyboard)
                 return
             self._pending_close_all_chats.add(message.chat.id)
+            if self.set_close_all_entry_pause:
+                self.set_close_all_entry_pause(True)
             await message.answer(
-                text + "\n\nПодтвердите массовое закрытие всех paper-позиций.",
+                text
+                + "\n\n⏸ Новые входы временно приостановлены до подтверждения или отмены."
+                + "\n\nПодтвердите массовое закрытие всех paper-позиций.",
                 reply_markup=confirm_close_keyboard,
             )
 
@@ -1538,7 +1546,10 @@ class TelegramCommandServer:
         @router.message(F.text == self.BTN_CONFIRM_CLOSE_ALL)
         async def button_confirm_close_all(message: Message) -> None:
             if message.chat.id not in self._pending_close_all_chats:
-                await message.answer("🛑 Нет ожидающего подтверждения на закрытие позиций.", reply_markup=actions_keyboard)
+                await message.answer(
+                    "ℹ️ Закрытие уже выполнено или подтверждение больше не активно.",
+                    reply_markup=actions_keyboard,
+                )
                 return
             self._pending_close_all_chats.discard(message.chat.id)
             await message.answer(self.close_all_execute_handler(), reply_markup=actions_keyboard)
@@ -1546,6 +1557,8 @@ class TelegramCommandServer:
         @router.message(F.text == self.BTN_CANCEL_CLOSE_ALL)
         async def button_cancel_close_all(message: Message) -> None:
             self._pending_close_all_chats.discard(message.chat.id)
+            if self.set_close_all_entry_pause:
+                self.set_close_all_entry_pause(False)
             await message.answer("Операция массового закрытия отменена.", reply_markup=actions_keyboard)
 
         @router.message(F.text == self.BTN_HELP)
@@ -1646,6 +1659,8 @@ class SignalEngine:
         # Защита от повторного BUY / re-entry на том же баре (UTC bucket по TV_INTERVAL)
         self._last_buy_bar_key: Dict[str, str] = {}
         self._last_close_bar_key: Dict[str, str] = {}
+        # Пауза новых BUY, пока в Telegram ждём подтверждение «Закрыть все позиции»
+        self._manual_close_all_pending = Event()
         # Многоуровневое сопровождение (position_management.py)
         self._pm_states: Dict[str, ManagedPositionState] = {}
         self._pm_profiles: Dict[str, InstrumentProfile] = {}
@@ -1696,6 +1711,12 @@ class SignalEngine:
                 LOGGER.warning("Failed to initialize adaptive layer: %s", exc)
                 self.adaptive_engine = None
         self.refresh_universe()
+
+    def set_manual_close_all_pending(self, active: bool) -> None:
+        if active:
+            self._manual_close_all_pending.set()
+        else:
+            self._manual_close_all_pending.clear()
 
     def refresh_universe(self) -> None:
         instruments = self.universe_provider.fetch()
@@ -2670,117 +2691,123 @@ class SignalEngine:
 
     def close_all_positions(self) -> str:
         with self._operator_lock:
-            allowed, text = self.can_close_all_positions()
-            if not allowed:
-                return text
+            try:
+                return self._close_all_positions_inner()
+            finally:
+                self._manual_close_all_pending.clear()
 
-            symbols = [symbol for symbol, qty in self.broker.positions.items() if safe_float(qty) > 0]
-            closed = 0
-            errors: List[str] = []
-            gross_total = 0.0
-            commission_total = 0.0
-            net_total = 0.0
+    def _close_all_positions_inner(self) -> str:
+        allowed, text = self.can_close_all_positions()
+        if not allowed:
+            return text
 
-            for symbol in list(symbols):
-                qty_before, avg_before = self.broker.get_position(symbol)
-                if qty_before <= 0:
-                    continue
-                try:
-                    snapshot = self.tv.get_snapshot(symbol)
-                    price = safe_float(snapshot.price)
-                    if price <= 0:
-                        raise RuntimeError("invalid market price")
-                    self.last_prices[symbol] = price
-                    execution = self.broker.place_order(
-                        symbol=symbol,
-                        side="SELL",
-                        amount_rub=qty_before * price,
-                        market_price=price,
-                    )
-                    if not execution:
-                        raise RuntimeError("paper execution returned empty result")
-                    open_signal_id = self.trade_meta.get(symbol, {}).get("signal_id")
-                    if self.analytics_logger:
-                        self.analytics_logger.update_signal_status(open_signal_id, "CLOSING")
-                    self._close_trade(
-                        symbol,
-                        price,
-                        "Manual close all",
-                        qty_before,
-                        avg_before,
-                        execution=execution,
-                        close_reason_code="MANUAL_CLOSE_ALL",
-                        extra_details={
-                            "manual_action": True,
-                            "operator_action": "close_all_positions",
-                        },
-                    )
-                    self._last_close_bar_key[symbol] = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
-                    closed += 1
-                    gross_total += safe_float(execution.get("gross_pnl"))
-                    commission_total += safe_float(execution.get("commission_rub"))
-                    net_total += safe_float(execution.get("net_pnl"))
-                except Exception as exc:  # pylint: disable=broad-except
-                    LOGGER.warning("Manual close-all failed for %s: %s", symbol, exc)
-                    errors.append(f"{symbol}: {exc}")
+        symbols = [symbol for symbol, qty in self.broker.positions.items() if safe_float(qty) > 0]
+        closed = 0
+        errors: List[str] = []
+        gross_total = 0.0
+        commission_total = 0.0
+        net_total = 0.0
 
-            balance_snapshot = (
-                self.broker.get_balance_snapshot(self.last_prices)
-                if isinstance(self.broker, PaperBroker)
-                else {"current_balance_rub": 0.0}
+        for symbol in list(symbols):
+            qty_before, avg_before = self.broker.get_position(symbol)
+            if qty_before <= 0:
+                continue
+            try:
+                snapshot = self.tv.get_snapshot(symbol)
+                price = safe_float(snapshot.price)
+                if price <= 0:
+                    raise RuntimeError("invalid market price")
+                self.last_prices[symbol] = price
+                execution = self.broker.place_order(
+                    symbol=symbol,
+                    side="SELL",
+                    amount_rub=qty_before * price,
+                    market_price=price,
+                )
+                if not execution:
+                    raise RuntimeError("paper execution returned empty result")
+                open_signal_id = self.trade_meta.get(symbol, {}).get("signal_id")
+                if self.analytics_logger:
+                    self.analytics_logger.update_signal_status(open_signal_id, "CLOSING")
+                self._close_trade(
+                    symbol,
+                    price,
+                    "Manual close all",
+                    qty_before,
+                    avg_before,
+                    execution=execution,
+                    close_reason_code="MANUAL_CLOSE_ALL",
+                    extra_details={
+                        "manual_action": True,
+                        "operator_action": "close_all_positions",
+                    },
+                )
+                self._last_close_bar_key[symbol] = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
+                closed += 1
+                gross_total += safe_float(execution.get("gross_pnl"))
+                commission_total += safe_float(execution.get("commission_rub"))
+                net_total += safe_float(execution.get("net_pnl"))
+            except Exception as exc:  # pylint: disable=broad-except
+                LOGGER.warning("Manual close-all failed for %s: %s", symbol, exc)
+                errors.append(f"{symbol}: {exc}")
+
+        balance_snapshot = (
+            self.broker.get_balance_snapshot(self.last_prices)
+            if isinstance(self.broker, PaperBroker)
+            else {"current_balance_rub": 0.0}
+        )
+        balance_before_reset = safe_float(balance_snapshot.get("current_balance_rub", 0.0))
+        remaining_open = [sym for sym, qty in self.broker.positions.items() if safe_float(qty) > 0]
+        all_closed_ok = len(errors) == 0 and len(remaining_open) == 0
+        default_initial_rub = float(self.settings.paper_initial_balance_rub)
+        reset_applied = False
+        new_balance_after_reset: Optional[float] = None
+        if all_closed_ok and isinstance(self.broker, PaperBroker):
+            reset_snap = self.broker.reset_balance(None)
+            self.trade_meta = {}
+            self._pm_states = {}
+            self._pm_profiles = {}
+            self._last_buy_bar_key = {}
+            self._last_close_bar_key = {}
+            self.last_performance = reset_snap
+            reset_applied = True
+            new_balance_after_reset = safe_float(reset_snap.get("current_balance_rub", default_initial_rub))
+
+        lines: List[str] = [
+            "🛑 Закрытие всех позиций завершено",
+            f"• Закрыто позиций: {closed} (было к закрытию: {len(symbols)})",
+            f"• Суммарный gross: {format_signed_rub(gross_total)}",
+            f"• Комиссия (всего): {format_rub(commission_total)}",
+            f"• Net (сумма): {format_signed_rub(net_total)}",
+        ]
+        if reset_applied and new_balance_after_reset is not None:
+            lines.extend(
+                [
+                    f"• Баланс до сброса: {format_rub(balance_before_reset)}",
+                    "✅ Paper-баланс сброшен на значение по умолчанию "
+                    f"(как /balance_reset без аргумента: {format_rub(default_initial_rub)}).",
+                    f"• Новый баланс после сброса: {format_rub(new_balance_after_reset)}",
+                ]
             )
-            balance_before_reset = safe_float(balance_snapshot.get("current_balance_rub", 0.0))
-            remaining_open = [sym for sym, qty in self.broker.positions.items() if safe_float(qty) > 0]
-            all_closed_ok = len(errors) == 0 and len(remaining_open) == 0
-            default_initial_rub = float(self.settings.paper_initial_balance_rub)
-            reset_applied = False
-            new_balance_after_reset: Optional[float] = None
-            if all_closed_ok and isinstance(self.broker, PaperBroker):
-                reset_snap = self.broker.reset_balance(None)
-                self.trade_meta = {}
-                self._pm_states = {}
-                self._pm_profiles = {}
-                self._last_buy_bar_key = {}
-                self._last_close_bar_key = {}
-                self.last_performance = reset_snap
-                reset_applied = True
-                new_balance_after_reset = safe_float(reset_snap.get("current_balance_rub", default_initial_rub))
-
-            lines: List[str] = [
-                "🛑 Закрытие всех позиций завершено",
-                f"• Закрыто позиций: {closed} (было к закрытию: {len(symbols)})",
-                f"• Суммарный gross: {format_signed_rub(gross_total)}",
-                f"• Комиссия (всего): {format_rub(commission_total)}",
-                f"• Net (сумма): {format_signed_rub(net_total)}",
-            ]
-            if reset_applied and new_balance_after_reset is not None:
-                lines.extend(
-                    [
-                        f"• Баланс до сброса: {format_rub(balance_before_reset)}",
-                        "✅ Paper-баланс сброшен на значение по умолчанию "
-                        f"(как /balance_reset без аргумента: {format_rub(default_initial_rub)}).",
-                        f"• Новый баланс после сброса: {format_rub(new_balance_after_reset)}",
-                    ]
-                )
-            else:
+        else:
+            lines.append(
+                f"• Текущий баланс (equity): {format_rub(balance_snapshot.get('current_balance_rub', 0))}"
+            )
+            if not all_closed_ok:
                 lines.append(
-                    f"• Текущий баланс (equity): {format_rub(balance_snapshot.get('current_balance_rub', 0))}"
+                    "⚠️ Сброс баланса не выполнён: остались незакрытые позиции или были ошибки закрытия."
                 )
-                if not all_closed_ok:
-                    lines.append(
-                        "⚠️ Сброс баланса не выполнён: остались незакрытые позиции или были ошибки закрытия."
-                    )
-            lines.append(f"• Ошибок закрытия: {len(errors)}")
-            summary = "\n".join(lines)
-            if errors:
-                summary += "\n" + "\n".join([f"• {item}" for item in errors[:8]])
-                if len(errors) > 8:
-                    summary += f"\n… и еще {len(errors) - 8}"
-            if remaining_open and not reset_applied:
-                summary += "\n• Не закрыто (позиции): " + ", ".join(remaining_open[:20])
-                if len(remaining_open) > 20:
-                    summary += f" … +{len(remaining_open) - 20}"
-            return summary
+        lines.append(f"• Ошибок закрытия: {len(errors)}")
+        summary = "\n".join(lines)
+        if errors:
+            summary += "\n" + "\n".join([f"• {item}" for item in errors[:8]])
+            if len(errors) > 8:
+                summary += f"\n… и еще {len(errors) - 8}"
+        if remaining_open and not reset_applied:
+            summary += "\n• Не закрыто (позиции): " + ", ".join(remaining_open[:20])
+            if len(remaining_open) > 20:
+                summary += f" … +{len(remaining_open) - 20}"
+        return summary
 
     def _check_risk_exit(self, symbol: str, price: float, bar_key: str) -> bool:
         if not isinstance(self.broker, PaperBroker):
@@ -2987,6 +3014,14 @@ class SignalEngine:
                                 details={"required_rub": self.settings.position_size_rub},
                                 decision_ts=self._iso_now(),
                             )
+                        continue
+
+                    if (
+                        action == "BUY"
+                        and self.settings.trading_mode == "paper"
+                        and self._manual_close_all_pending.is_set()
+                    ):
+                        LOGGER.info("BUY skipped %s: awaiting Telegram close-all confirmation", symbol)
                         continue
 
                     bar_key_buy: Optional[str] = None
@@ -3273,6 +3308,11 @@ def main() -> None:
             return "⏳ Бот инициализируется, подождите..."
         return current.close_all_positions()
 
+    def set_close_all_entry_pause(active: bool) -> None:
+        current = engine_ref["engine"]
+        if current is not None:
+            current.set_manual_close_all_pending(active)
+
     command_server = TelegramCommandServer(
         settings,
         status_provider,
@@ -3284,6 +3324,7 @@ def main() -> None:
         balance_set_handler,
         close_all_check_handler,
         close_all_execute_handler,
+        set_close_all_entry_pause,
     )
     if command_server.enabled():
         command_server.start()
