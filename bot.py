@@ -1793,6 +1793,54 @@ class SignalEngine:
         except Exception:
             return None
 
+    @staticmethod
+    def _entry_risk_sizing_fields(
+        feature_snapshot: Dict[str, Any],
+        trading_mode: str,
+        base_position_size_rub: float,
+    ) -> Dict[str, Any]:
+        """Paper-only sizing; live/BCS logs metrics with multiplier 1.0."""
+        vr = SignalEngine._safe_float_or_none(feature_snapshot.get("volume_ratio"))
+        dist = SignalEngine._safe_float_or_none(feature_snapshot.get("price_vs_ema200_pct"))
+        if dist is None:
+            clo = SignalEngine._safe_float_or_none(feature_snapshot.get("close"))
+            em200 = SignalEngine._safe_float_or_none(feature_snapshot.get("ema200"))
+            if clo is not None and em200 is not None and em200 != 0:
+                dist = (clo - em200) / em200 * 100.0
+
+        raw_v = vr if vr is not None else float("-inf")
+        raw_d = dist if dist is not None else float("-inf")
+
+        rm = 1.0
+        tags: List[str] = []
+        apply_sizing = trading_mode == "paper"
+        if apply_sizing:
+            if raw_v > 2.0:
+                rm = 0.5
+                tags.append("volume_ratio_gt_2")
+            if raw_v > 5.0:
+                rm = 0.25
+                tags.append("volume_ratio_gt_5")
+            if raw_v > 2.0 and raw_d > 2.0:
+                before_overlay = rm
+                rm = min(rm, 0.25)
+                if rm < before_overlay or rm == 0.25:
+                    tags.append("overextended_above_ema_pct_gt_2_caps_min")
+            reason = ";".join(tags) if tags else "baseline"
+        else:
+            reason = "disabled_non_paper_mode"
+
+        eff = round(float(base_position_size_rub) * float(rm), 2)
+
+        return {
+            "entry_risk_multiplier": float(rm),
+            "entry_risk_reason": reason,
+            "volume_ratio": vr,
+            "distance_above_ema200_pct": dist,
+            "base_position_size_rub": float(base_position_size_rub),
+            "effective_position_size_rub": float(base_position_size_rub) if not apply_sizing else eff,
+        }
+
     def _build_feature_snapshot(self, df: Any, features_df: Any) -> Dict[str, Any]:
         feature_snapshot: Dict[str, Any] = {
             "close": None,
@@ -2107,6 +2155,7 @@ class SignalEngine:
         sl_price: float,
         tp_price: float,
         adaptive_note: Optional[str] = None,
+        entry_risk: Optional[Dict[str, Any]] = None,
     ) -> str:
         text = (
             f"🟢 {symbol} | ВХОД LONG\n"
@@ -2121,6 +2170,19 @@ class SignalEngine:
         )
         if adaptive_note:
             text += f"\n🧩 {adaptive_note}"
+        if (
+            entry_risk
+            and self.settings.trading_mode == "paper"
+            and "effective_position_size_rub" in entry_risk
+        ):
+            mult = float(entry_risk.get("entry_risk_multiplier", 1.0))
+            text += (
+                f"\n💼 Размер позиции: {format_rub(entry_risk['effective_position_size_rub'])} "
+                f"(база {format_rub(entry_risk.get('base_position_size_rub', self.settings.position_size_rub))})"
+            )
+            text += f"\n📐 Множитель риска: {mult}"
+            if mult < 1.0:
+                text += "\n⚠️ Размер позиции снижен из-за рискованного входа"
         return text
 
     def _adaptive_note_from_meta(self, adaptive_meta: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -2922,10 +2984,23 @@ class SignalEngine:
                     has_position = qty > 0
                     decision_meta = self._last_decision_meta.get(symbol, {})
                     feature_snapshot = decision_meta.get("feature_snapshot", {})
-                    model_snapshot = decision_meta.get("model_snapshot", {})
+                    if not isinstance(feature_snapshot, dict):
+                        feature_snapshot = {}
+                    model_snapshot = dict(decision_meta.get("model_snapshot", {}))
                     reason_code = decision_meta.get("reason_code")
                     reason_text = decision_meta.get("reason_text")
                     market_regime = decision_meta.get("market_regime")
+
+                    entry_risk_snapshot: Optional[Dict[str, Any]] = None
+                    effective_buy_rub = self.settings.position_size_rub
+                    if action == "BUY":
+                        entry_risk_snapshot = self._entry_risk_sizing_fields(
+                            feature_snapshot,
+                            self.settings.trading_mode,
+                            self.settings.position_size_rub,
+                        )
+                        model_snapshot.update(entry_risk_snapshot)
+                        effective_buy_rub = float(entry_risk_snapshot["effective_position_size_rub"])
 
                     if has_position and action in ("BUY", "HOLD"):
                         if self.analytics_logger and self.settings.analytics_log_holds:
@@ -2995,7 +3070,7 @@ class SignalEngine:
                             )
                         continue
 
-                    if action == "BUY" and not self.broker.can_afford_buy(self.settings.position_size_rub):
+                    if action == "BUY" and not self.broker.can_afford_buy(effective_buy_rub):
                         if self.analytics_logger:
                             block_signal_id = self.analytics_logger.log_signal(
                                 run_id=self.current_run_id,
@@ -3024,7 +3099,11 @@ class SignalEngine:
                                 decision_label="BLOCK",
                                 reason_code="INSUFFICIENT_CASH",
                                 reason_text="Cannot afford new buy by position sizing rule.",
-                                details={"required_rub": self.settings.position_size_rub},
+                                details={
+                                    "required_rub": effective_buy_rub,
+                                    "position_size_rub": self.settings.position_size_rub,
+                                    **(entry_risk_snapshot or {}),
+                                },
                                 decision_ts=self._iso_now(),
                             )
                         continue
@@ -3098,13 +3177,24 @@ class SignalEngine:
                             decision_label=action,
                             reason_code=reason_code,
                             reason_text=reason_text,
-                            details={
-                                "score": score,
-                                "price": snapshot.price,
-                                "strategy_mode": self.settings.strategy_mode,
-                                "adaptive_mode": self.settings.adaptive_mode,
-                                "adaptive_decision": adaptive_meta,
-                            },
+                            details=(
+                                {
+                                    "score": score,
+                                    "price": snapshot.price,
+                                    "strategy_mode": self.settings.strategy_mode,
+                                    "adaptive_mode": self.settings.adaptive_mode,
+                                    "adaptive_decision": adaptive_meta,
+                                    **(entry_risk_snapshot or {}),
+                                }
+                                if action == "BUY"
+                                else {
+                                    "score": score,
+                                    "price": snapshot.price,
+                                    "strategy_mode": self.settings.strategy_mode,
+                                    "adaptive_mode": self.settings.adaptive_mode,
+                                    "adaptive_decision": adaptive_meta,
+                                }
+                            ),
                             decision_ts=self._iso_now(),
                         )
                         if self.adaptive_engine is not None and adaptive_meta is not None:
@@ -3127,7 +3217,7 @@ class SignalEngine:
                         execution = self.broker.place_order(
                             symbol=symbol,
                             side="BUY",
-                            amount_rub=self.settings.position_size_rub,
+                            amount_rub=effective_buy_rub,
                             market_price=snapshot.price,
                         )
                         after_qty, after_avg = self.broker.get_position(symbol)
@@ -3138,7 +3228,13 @@ class SignalEngine:
                             tp_price = after_avg * (1.0 + self.strategy.take_profit_pct)
                             adaptive_note = self._adaptive_note_from_meta(adaptive_meta)
                             entry_message = self._format_entry_message(
-                                symbol, score, snapshot, sl_price, tp_price, adaptive_note=adaptive_note
+                                symbol,
+                                score,
+                                snapshot,
+                                sl_price,
+                                tp_price,
+                                adaptive_note=adaptive_note,
+                                entry_risk=entry_risk_snapshot,
                             )
                             entry_message_id = self.notifier.send(entry_message)
                             self.trade_meta[symbol] = {
@@ -3170,6 +3266,7 @@ class SignalEngine:
                                         "net_pnl_pct": safe_float(execution.get("net_pnl_pct")) if execution else 0.0,
                                         "commission_rate": self.settings.paper_commission_rate if self.settings.paper_include_commission else 0.0,
                                         "notional_rub": safe_float(execution.get("notional_rub")) if execution else snapshot.price * (after_qty - before_qty),
+                                        **(entry_risk_snapshot or {}),
                                     },
                                     decision_ts=self._iso_now(),
                                 )
