@@ -26,6 +26,7 @@ from position_management import (
     evaluate_tick,
 )
 from analytics import AnalyticsDB, OutcomeEvaluator, PaperTradeMapper, SignalLogger, safe_to_json
+from analytics.trade_signal_id import resolve_buy_signal_id_at_close
 from aiogram.filters import Command, CommandStart
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
@@ -2181,8 +2182,11 @@ class SignalEngine:
             else gross_pnl_pct
         )
         pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
+        meta_before = self.trade_meta.get(symbol)
+        signal_id, signal_id_missing_reason = resolve_buy_signal_id_at_close(
+            self.analytics_db, symbol, meta_before
+        )
         meta = self.trade_meta.pop(symbol, None)
-        signal_id = meta.get("signal_id") if meta else None
         local_trade_id = meta.get("local_trade_id") if meta else None
         adaptive_note = meta.get("adaptive_note") if meta else None
         balance_lines = self._balance_lines_for_message({**self.last_prices, symbol: exit_price})
@@ -2206,6 +2210,26 @@ class SignalEngine:
         self.notifier.send(close_text)
         if self.analytics_logger:
             try:
+                close_details: Dict[str, Any] = {
+                    "qty": qty,
+                    "avg_price": avg_price,
+                    "exit_price": exit_price,
+                    "pnl": net_pnl,
+                    "pnl_pct": net_pnl_pct,
+                    "gross_pnl": gross_pnl,
+                    "gross_pnl_pct": gross_pnl_pct,
+                    "commission_rub": commission_rub,
+                    "net_pnl": net_pnl,
+                    "net_pnl_pct": net_pnl_pct,
+                    "commission_rate": self.settings.paper_commission_rate if self.settings.paper_include_commission else 0.0,
+                    "notional_rub": safe_float(execution.get("notional_rub")) if execution else qty * exit_price,
+                    "entry_commission_allocated_rub": safe_float(execution.get("entry_commission_allocated_rub")) if execution else 0.0,
+                    "exit_commission_rub": safe_float(execution.get("exit_commission_rub")) if execution else commission_rub,
+                    "balance_after_rub": balance_after_rub,
+                    **(extra_details or {}),
+                }
+                if signal_id is None and signal_id_missing_reason:
+                    close_details["signal_id_missing_reason"] = signal_id_missing_reason
                 self.analytics_logger.update_signal_status(signal_id, "CLOSED")
                 self.analytics_logger.log_decision(
                     run_id=self.current_run_id,
@@ -2215,24 +2239,7 @@ class SignalEngine:
                     decision_label="SELL",
                     reason_code=close_reason_code,
                     reason_text=reason,
-                    details={
-                        "qty": qty,
-                        "avg_price": avg_price,
-                        "exit_price": exit_price,
-                        "pnl": net_pnl,
-                        "pnl_pct": net_pnl_pct,
-                        "gross_pnl": gross_pnl,
-                        "gross_pnl_pct": gross_pnl_pct,
-                        "commission_rub": commission_rub,
-                        "net_pnl": net_pnl,
-                        "net_pnl_pct": net_pnl_pct,
-                        "commission_rate": self.settings.paper_commission_rate if self.settings.paper_include_commission else 0.0,
-                        "notional_rub": safe_float(execution.get("notional_rub")) if execution else qty * exit_price,
-                        "entry_commission_allocated_rub": safe_float(execution.get("entry_commission_allocated_rub")) if execution else 0.0,
-                        "exit_commission_rub": safe_float(execution.get("exit_commission_rub")) if execution else commission_rub,
-                        "balance_after_rub": balance_after_rub,
-                        **(extra_details or {}),
-                    },
+                    details=close_details,
                     decision_ts=self._iso_now(),
                 )
             except Exception as exc:  # pylint: disable=broad-except
@@ -2361,11 +2368,31 @@ class SignalEngine:
         msg += self._trade_result_lines(gross_pnl, gross_pnl_pct, commission_rub, net_pnl, net_pnl_pct)
         msg += balance_lines
         self.notifier.send(msg)
-        meta = self.trade_meta.get(symbol, {})
-        signal_id = meta.get("signal_id")
-        local_trade_id = meta.get("local_trade_id")
+        m = self.trade_meta.get(symbol)
+        signal_id, signal_id_missing_reason = resolve_buy_signal_id_at_close(
+            self.analytics_db, symbol, m
+        )
+        local_trade_id = m.get("local_trade_id") if m else None
         if self.analytics_logger:
             try:
+                part_details: Dict[str, Any] = {
+                    **details,
+                    "qty_exit": qty_exit,
+                    "exit_price": exit_price,
+                    "pnl": net_pnl,
+                    "pnl_pct": net_pnl_pct,
+                    "gross_pnl": gross_pnl,
+                    "gross_pnl_pct": gross_pnl_pct,
+                    "commission_rub": commission_rub,
+                    "net_pnl": net_pnl,
+                    "net_pnl_pct": net_pnl_pct,
+                    "commission_rate": self.settings.paper_commission_rate if self.settings.paper_include_commission else 0.0,
+                    "notional_rub": safe_float(execution.get("notional_rub")) if execution else qty_exit * exit_price,
+                    "entry_commission_allocated_rub": safe_float(execution.get("entry_commission_allocated_rub")) if execution else 0.0,
+                    "exit_commission_rub": safe_float(execution.get("exit_commission_rub")) if execution else commission_rub,
+                }
+                if signal_id is None and signal_id_missing_reason:
+                    part_details["signal_id_missing_reason"] = signal_id_missing_reason
                 self.analytics_logger.log_decision(
                     run_id=self.current_run_id,
                     signal_id=signal_id,
@@ -2374,22 +2401,7 @@ class SignalEngine:
                     decision_label="PARTIAL_EXIT",
                     reason_code=reason_code,
                     reason_text="Partial exit (position management)",
-                    details={
-                        **details,
-                        "qty_exit": qty_exit,
-                        "exit_price": exit_price,
-                        "pnl": net_pnl,
-                        "pnl_pct": net_pnl_pct,
-                        "gross_pnl": gross_pnl,
-                        "gross_pnl_pct": gross_pnl_pct,
-                        "commission_rub": commission_rub,
-                        "net_pnl": net_pnl,
-                        "net_pnl_pct": net_pnl_pct,
-                        "commission_rate": self.settings.paper_commission_rate if self.settings.paper_include_commission else 0.0,
-                        "notional_rub": safe_float(execution.get("notional_rub")) if execution else qty_exit * exit_price,
-                        "entry_commission_allocated_rub": safe_float(execution.get("entry_commission_allocated_rub")) if execution else 0.0,
-                        "exit_commission_rub": safe_float(execution.get("exit_commission_rub")) if execution else commission_rub,
-                    },
+                    details=part_details,
                     decision_ts=self._iso_now(),
                 )
             except Exception as exc:  # pylint: disable=broad-except
@@ -2726,7 +2738,8 @@ class SignalEngine:
                 )
                 if not execution:
                     raise RuntimeError("paper execution returned empty result")
-                open_signal_id = self.trade_meta.get(symbol, {}).get("signal_id")
+                meta_open = self.trade_meta.get(symbol)
+                open_signal_id, _ = resolve_buy_signal_id_at_close(self.analytics_db, symbol, meta_open)
                 if self.analytics_logger:
                     self.analytics_logger.update_signal_status(open_signal_id, "CLOSING")
                 self._close_trade(
@@ -3180,7 +3193,10 @@ class SignalEngine:
                                 continue
                         self.current_signals_found += 1
                         if qty_before > 0:
-                            open_signal_id = self.trade_meta.get(symbol, {}).get("signal_id")
+                            meta_open = self.trade_meta.get(symbol)
+                            open_signal_id, _ = resolve_buy_signal_id_at_close(
+                                self.analytics_db, symbol, meta_open
+                            )
                             execution = self.broker.place_order(
                                 symbol=symbol,
                                 side="SELL",
