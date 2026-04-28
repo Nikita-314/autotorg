@@ -62,6 +62,4 @@ def resolve_buy_signal_id_at_close(
 
     if trade_meta_entry is None:
         return None, "trade_meta_missing_after_restart"
-    if not trade_meta_entry.get("signal_id"):
-        return None, "signal_id_missing_in_trade_meta_unrecoverable"
-    return None, "signal_id_unrecoverable_no_matching_open_record"
+    return None, "signal_id_missing_in_trade_meta_unrecoverable"
