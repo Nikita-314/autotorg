@@ -2895,11 +2895,24 @@ class SignalEngine:
         return True, f"🛑 Будут закрыты текущие paper-позиции: {len(open_symbols)}"
 
     def close_all_positions(self) -> str:
-        with self._operator_lock:
-            try:
-                return self._close_all_positions_inner()
-            finally:
-                self._manual_close_all_pending.clear()
+        """Массовое закрытие: не блокируется навечно при занятости lock главным циклом run_once."""
+        lock_timeout_sec = 5.0
+        if not self._operator_lock.acquire(timeout=lock_timeout_sec):
+            LOGGER.error(
+                "close_all_positions: operator lock timeout after %.1fs (main cycle likely holding lock)",
+                lock_timeout_sec,
+            )
+            self._manual_close_all_pending.clear()
+            return (
+                f"❌ Не удалось начать массовое закрытие: торговый цикл занят "
+                f"(lock timeout {lock_timeout_sec:.0f}s).\n"
+                "Повторите через несколько секунд."
+            )
+        try:
+            return self._close_all_positions_inner()
+        finally:
+            self._manual_close_all_pending.clear()
+            self._operator_lock.release()
 
     def _close_all_positions_inner(self) -> str:
         allowed, text = self.can_close_all_positions()
@@ -2913,8 +2926,14 @@ class SignalEngine:
         commission_total = 0.0
         net_total = 0.0
         used_avg_price_fallback = False
+        loop_deadline_sec = 10.0
+        loop_start = time.monotonic()
 
         for symbol in list(symbols):
+            if time.monotonic() - loop_start > loop_deadline_sec:
+                LOGGER.error("ERROR: close_all timeout (>%.0fs)", loop_deadline_sec)
+                errors.append("TIMEOUT: превышен лимит %.0fs на массовое закрытие" % loop_deadline_sec)
+                break
             qty_before, avg_before = self.broker.get_position(symbol)
             if qty_before <= 0:
                 continue
@@ -2966,6 +2985,7 @@ class SignalEngine:
                 commission_total += safe_float(execution.get("commission_rub"))
                 net_total += safe_float(execution.get("net_pnl"))
             except Exception as exc:  # pylint: disable=broad-except
+                print(f"ERROR closing {symbol}: {exc}", flush=True)
                 LOGGER.warning("Manual close-all failed for %s: %s", symbol, exc)
                 errors.append(f"{symbol}: {exc}")
 
