@@ -1553,7 +1553,11 @@ class TelegramCommandServer:
                 )
                 return
             self._pending_close_all_chats.discard(message.chat.id)
-            await message.answer(self.close_all_execute_handler(), reply_markup=actions_keyboard)
+            await message.answer(
+                "⏳ Закрываю позиции...", reply_markup=actions_keyboard
+            )
+            summary = await asyncio.to_thread(self.close_all_execute_handler)
+            await message.answer(summary, reply_markup=actions_keyboard)
 
         @router.message(F.text == self.BTN_CANCEL_CLOSE_ALL)
         async def button_cancel_close_all(message: Message) -> None:
@@ -1991,6 +1995,27 @@ class SignalEngine:
                 LOGGER.warning("Exit market price fallback=avg_entry symbol=%s price=%.6f", sym, avgp)
                 return avgp
         raise RuntimeError(f"Cannot resolve exit market price for {sym}")
+
+    def _manual_close_all_safe_price(self, symbol: str) -> Tuple[float, str]:
+        """Только локальные данные для mass close-all — без сетевого quote (MOEX/TV/yf)."""
+        lp = safe_float(self.last_prices.get(symbol))
+        if lp > 0:
+            return lp, "last_price"
+        sanitized_last: Dict[str, float] = {
+            k: v for k, v in self.last_prices.items() if safe_float(v) > 0
+        }
+        if isinstance(self.broker, PaperBroker):
+            for row in self.broker.get_open_positions(sanitized_last):
+                if row.get("symbol") != symbol:
+                    continue
+                broker_last = safe_float(row.get("last_price"))
+                if broker_last > 0:
+                    return broker_last, "broker_last_price"
+        qty, avg = self.broker.get_position(symbol)
+        avg = safe_float(avg)
+        if avg > 0 and safe_float(qty) > 0:
+            return avg, "avg_price_fallback"
+        raise RuntimeError(f"manual close-all: no local price for {symbol}")
 
     def _log_model_inference(
         self,
@@ -2887,21 +2912,31 @@ class SignalEngine:
         gross_total = 0.0
         commission_total = 0.0
         net_total = 0.0
+        used_avg_price_fallback = False
 
         for symbol in list(symbols):
             qty_before, avg_before = self.broker.get_position(symbol)
             if qty_before <= 0:
                 continue
             try:
-                price = self._exit_market_price(symbol)
+                price, price_source = self._manual_close_all_safe_price(symbol)
                 LOGGER.info(
-                    "POSITION_CLOSE manual_close_all broker_symbol=%s qty=%.6f price=%.6f",
+                    "POSITION_CLOSE manual_close_all broker_symbol=%s qty=%.6f price=%.6f source=%s",
                     symbol,
                     qty_before,
                     price,
+                    price_source,
                 )
                 if price <= 0:
                     raise RuntimeError("invalid market price")
+                extra_close: Dict[str, Any] = {
+                    "manual_action": True,
+                    "operator_action": "close_all_positions",
+                    "price_source": price_source,
+                }
+                if price_source == "avg_price_fallback":
+                    extra_close["manual_close_price_warning"] = "used_avg_price_fallback"
+                    used_avg_price_fallback = True
                 self.last_prices[symbol] = price
                 execution = self.broker.place_order(
                     symbol=symbol,
@@ -2923,10 +2958,7 @@ class SignalEngine:
                     avg_before,
                     execution=execution,
                     close_reason_code="MANUAL_CLOSE_ALL",
-                    extra_details={
-                        "manual_action": True,
-                        "operator_action": "close_all_positions",
-                    },
+                    extra_details=extra_close,
                 )
                 self._last_close_bar_key[symbol] = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
                 closed += 1
@@ -2967,6 +2999,8 @@ class SignalEngine:
             f"• Комиссия (всего): {format_rub(commission_total)}",
             f"• Net (сумма): {format_signed_rub(net_total)}",
         ]
+        if used_avg_price_fallback:
+            lines.append("⚠️ Для части позиций использована fallback-цена avg_price.")
         if reset_applied and new_balance_after_reset is not None:
             lines.extend(
                 [
