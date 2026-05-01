@@ -1949,6 +1949,49 @@ class SignalEngine:
         except Exception as exc:  # pylint: disable=broad-except
             LOGGER.warning("Analytics log failed for BUY confirmation reject %s: %s", symbol, exc)
 
+    def _resolve_open_position_symbol(self, symbol_hint: str) -> Optional[str]:
+        """Точный ключ позиции в PaperBroker (без пересборки из feature_snapshot)."""
+        if not isinstance(self.broker, PaperBroker):
+            return symbol_hint
+        qty, _ = self.broker.get_position(symbol_hint)
+        if safe_float(qty) > 0:
+            return symbol_hint
+        hint_u = str(symbol_hint).strip().upper()
+        for key, q in self.broker.positions.items():
+            if str(key).strip().upper() == hint_u and safe_float(q) > 0:
+                return str(key)
+        return None
+
+    def _exit_market_price(self, position_symbol: str) -> float:
+        """
+        Цена для закрытия: тикер — ключ позиции в broker; порядок источников без feature_snapshot.
+        """
+        sym = position_symbol
+        lastp = safe_float(self.last_prices.get(sym))
+        if lastp > 0:
+            LOGGER.info("Exit market price source=last_prices symbol=%s price=%.6f", sym, lastp)
+            return lastp
+        moex_snap = _get_snapshot_from_moex(sym, self.settings.exchange, self.settings.interval)
+        if moex_snap is not None and safe_float(moex_snap.price) > 0:
+            p = safe_float(moex_snap.price)
+            LOGGER.info("Exit market price source=moex symbol=%s price=%.6f", sym, p)
+            return p
+        try:
+            tv_snap = self.tv.get_snapshot(sym)
+            p = safe_float(tv_snap.price)
+            if p > 0:
+                LOGGER.info("Exit market price source=tradingview symbol=%s price=%.6f", sym, p)
+                return p
+        except Exception as exc:  # pylint: disable=broad-except
+            LOGGER.warning("Exit market price: TradingView failed for %s: %s", sym, exc)
+        if isinstance(self.broker, PaperBroker):
+            _, avgp = self.broker.get_position(sym)
+            avgp = safe_float(avgp)
+            if avgp > 0:
+                LOGGER.warning("Exit market price fallback=avg_entry symbol=%s price=%.6f", sym, avgp)
+                return avgp
+        raise RuntimeError(f"Cannot resolve exit market price for {sym}")
+
     def _log_model_inference(
         self,
         symbol: str,
@@ -2610,25 +2653,31 @@ class SignalEngine:
         if mode != "paper":
             return False
 
+        pos_sym = self._resolve_open_position_symbol(symbol) or symbol
+
         for ev in events:
             if ev.full_exit:
-                qty, avg_price = self.broker.get_position(symbol)
+                qty, avg_price = self.broker.get_position(pos_sym)
                 if qty <= 0:
                     self._pm_states.pop(symbol, None)
                     return True
-                execution = self.broker.place_order(symbol, "SELL", qty * price, price)
-                self._close_trade(symbol, price, f"PM:{ev.code}", qty, avg_price, execution=execution)
-                self._last_close_bar_key[symbol] = bar_key
+                exec_price = self._exit_market_price(pos_sym)
+                LOGGER.info("POSITION_CLOSE pm_full symbol=%s (broker=%s) exec_price=%.6f", symbol, pos_sym, exec_price)
+                execution = self.broker.place_order(pos_sym, "SELL", qty * exec_price, exec_price)
+                self._close_trade(pos_sym, exec_price, f"PM:{ev.code}", qty, avg_price, execution=execution)
+                self._last_close_bar_key[pos_sym] = bar_key
                 return True
             if ev.close_fraction > 0:
-                qty, avg_price = self.broker.get_position(symbol)
+                qty, avg_price = self.broker.get_position(pos_sym)
                 if qty <= 0:
                     continue
                 qty_close = qty * ev.close_fraction
-                amount_rub = qty_close * price
-                execution = self.broker.place_order(symbol, "SELL", amount_rub, price)
-                self._partial_close_trade(symbol, price, qty_close, ev.code, ev.details, execution=execution)
-                q_new, _ = self.broker.get_position(symbol)
+                exec_price = self._exit_market_price(pos_sym)
+                amount_rub = qty_close * exec_price
+                LOGGER.info("POSITION_CLOSE pm_partial symbol=%s (broker=%s) exec_price=%.6f", symbol, pos_sym, exec_price)
+                execution = self.broker.place_order(pos_sym, "SELL", amount_rub, exec_price)
+                self._partial_close_trade(pos_sym, exec_price, qty_close, ev.code, ev.details, execution=execution)
+                q_new, _ = self.broker.get_position(pos_sym)
                 state.remaining_qty = q_new
 
         self._pm_states[symbol] = state
@@ -2642,7 +2691,8 @@ class SignalEngine:
         """Классический фиксированный SL/TP от стратегии."""
         if not isinstance(self.broker, PaperBroker):
             return False
-        qty, avg_price = self.broker.get_position(symbol)
+        pos_sym = self._resolve_open_position_symbol(symbol) or symbol
+        qty, avg_price = self.broker.get_position(pos_sym)
         if qty <= 0 or avg_price <= 0:
             return False
 
@@ -2650,14 +2700,18 @@ class SignalEngine:
         tp_price = avg_price * (1.0 + self.strategy.take_profit_pct)
 
         if price <= sl_price:
-            execution = self.broker.place_order(symbol, "SELL", qty * price, price)
-            self._close_trade(symbol, price, "Stop-loss", qty, avg_price, execution=execution)
-            self._last_close_bar_key[symbol] = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
+            exec_price = self._exit_market_price(pos_sym)
+            LOGGER.info("POSITION_CLOSE sl/tp symbol=%s (broker=%s) exec_price=%.6f", symbol, pos_sym, exec_price)
+            execution = self.broker.place_order(pos_sym, "SELL", qty * exec_price, exec_price)
+            self._close_trade(pos_sym, exec_price, "Stop-loss", qty, avg_price, execution=execution)
+            self._last_close_bar_key[pos_sym] = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
             return True
         if price >= tp_price:
-            execution = self.broker.place_order(symbol, "SELL", qty * price, price)
-            self._close_trade(symbol, price, "Take-profit", qty, avg_price, execution=execution)
-            self._last_close_bar_key[symbol] = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
+            exec_price = self._exit_market_price(pos_sym)
+            LOGGER.info("POSITION_CLOSE sl/tp symbol=%s (broker=%s) exec_price=%.6f", symbol, pos_sym, exec_price)
+            execution = self.broker.place_order(pos_sym, "SELL", qty * exec_price, exec_price)
+            self._close_trade(pos_sym, exec_price, "Take-profit", qty, avg_price, execution=execution)
+            self._last_close_bar_key[pos_sym] = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
             return True
         return False
 
@@ -2839,8 +2893,13 @@ class SignalEngine:
             if qty_before <= 0:
                 continue
             try:
-                snapshot = self.tv.get_snapshot(symbol)
-                price = safe_float(snapshot.price)
+                price = self._exit_market_price(symbol)
+                LOGGER.info(
+                    "POSITION_CLOSE manual_close_all broker_symbol=%s qty=%.6f price=%.6f",
+                    symbol,
+                    qty_before,
+                    price,
+                )
                 if price <= 0:
                     raise RuntimeError("invalid market price")
                 self.last_prices[symbol] = price
@@ -3350,6 +3409,12 @@ class SignalEngine:
                         )
                         after_qty, after_avg = self.broker.get_position(symbol)
                         if after_qty > before_qty:
+                            LOGGER.info(
+                                "POSITION_OPEN broker_symbol=%s qty_delta=%.6f avg_price=%.6f",
+                                symbol,
+                                after_qty - before_qty,
+                                after_avg,
+                            )
                             if bar_key_buy is not None:
                                 self._last_buy_bar_key[symbol] = bar_key_buy
                             self._pending_buy.pop(symbol, None)
@@ -3411,31 +3476,41 @@ class SignalEngine:
                                 )
                             self._maybe_init_position_management(symbol, after_avg, after_qty, bar_key_buy)
                     elif action == "SELL":
-                        qty_before, avg_before = self.broker.get_position(symbol)
+                        pos_sym = self._resolve_open_position_symbol(symbol) or symbol
+                        qty_before, avg_before = self.broker.get_position(pos_sym)
                         if qty_before > 0:
                             bar_key_exit = _bar_key_at(datetime.now(timezone.utc), self.settings.interval)
-                            entry_bar_key = self.trade_meta.get(symbol, {}).get("entry_bar_key")
+                            entry_bar_key = (self.trade_meta.get(pos_sym) or self.trade_meta.get(symbol) or {}).get(
+                                "entry_bar_key"
+                            )
                             if entry_bar_key is not None and entry_bar_key == bar_key_exit:
-                                LOGGER.info("EXIT SKIPPED: same bar as entry [%s]", symbol)
+                                LOGGER.info("EXIT SKIPPED: same bar as entry [%s]", pos_sym)
                                 continue
                         self.current_signals_found += 1
                         if qty_before > 0:
-                            meta_open = self.trade_meta.get(symbol)
+                            exit_price = self._exit_market_price(pos_sym)
+                            LOGGER.info(
+                                "POSITION_CLOSE strategy_sell loop_symbol=%s broker_symbol=%s price=%.6f",
+                                symbol,
+                                pos_sym,
+                                exit_price,
+                            )
+                            meta_open = self.trade_meta.get(pos_sym) or self.trade_meta.get(symbol)
                             open_signal_id, _ = resolve_buy_signal_id_at_close(
-                                self.analytics_db, symbol, meta_open
+                                self.analytics_db, pos_sym, meta_open
                             )
                             execution = self.broker.place_order(
-                                symbol=symbol,
+                                symbol=pos_sym,
                                 side="SELL",
-                                amount_rub=qty_before * snapshot.price,
-                                market_price=snapshot.price,
+                                amount_rub=qty_before * exit_price,
+                                market_price=exit_price,
                             )
                             if self.analytics_logger:
                                 self.analytics_logger.update_signal_status(open_signal_id, "CLOSING")
                             self._close_trade(
-                                symbol, snapshot.price, "Сигнал стратегии", qty_before, avg_before, execution=execution
+                                pos_sym, exit_price, "Сигнал стратегии", qty_before, avg_before, execution=execution
                             )
-                            self._last_close_bar_key[symbol] = _bar_key_at(
+                            self._last_close_bar_key[pos_sym] = _bar_key_at(
                                 datetime.now(timezone.utc), self.settings.interval
                             )
                     elif self.notifier.notify_hold:
